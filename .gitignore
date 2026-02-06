@@ -1,0 +1,11 @@
+/target
+Cargo.lock
+*.dll
+*.so
+*.dylib
+*.pdb
+*.exp
+*.lib
+
+# Generated header (rebuild from source)
+# include/swifttunnel.h

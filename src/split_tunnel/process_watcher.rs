@@ -1,0 +1,449 @@
+//! ETW Process Watcher - Instant Process Detection
+//!
+//! Uses Windows Event Tracing (ETW) to detect process creation INSTANTLY,
+//! before the process makes any network connections.
+//!
+//! This solves the race condition where:
+//! 1. Browser launches RobloxPlayerBeta.exe via roblox-player:// protocol
+//! 2. Roblox immediately tries to connect to game server
+//! 3. Our polling hasn't detected the process yet
+//! 4. First packets bypass VPN
+//!
+//! With ETW, we get notified within microseconds of process creation.
+//!
+//! ## Provider
+//! Microsoft-Windows-Kernel-Process (GUID: 22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716)
+//! Event ID 1 = Process Start
+//!
+//! ## Requirements
+//! - Administrator privileges (for kernel-level ETW provider)
+//! - Windows 10 or later
+
+use std::collections::HashSet;
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use crossbeam_channel::{Sender, Receiver, bounded};
+use parking_lot::RwLock;
+
+#[cfg(windows)]
+use windows::core::{GUID, PCWSTR, PWSTR};
+#[cfg(windows)]
+use windows::Win32::Foundation::{
+    ERROR_SUCCESS, HANDLE,
+};
+#[cfg(windows)]
+use windows::Win32::System::Diagnostics::Etw::{
+    StartTraceW, ControlTraceW, EnableTraceEx2, OpenTraceW, ProcessTrace, CloseTrace,
+    EVENT_TRACE_PROPERTIES, EVENT_TRACE_LOGFILEW, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP,
+    EVENT_TRACE_REAL_TIME_MODE, TRACE_LEVEL_INFORMATION, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+    PROCESS_TRACE_MODE_REAL_TIME, PROCESS_TRACE_MODE_EVENT_RECORD, WNODE_FLAG_TRACED_GUID,
+    EVENT_TRACE_FLAG_PROCESS, CONTROLTRACE_HANDLE, PROCESSTRACE_HANDLE,
+};
+
+/// Microsoft-Windows-Kernel-Process provider GUID
+#[cfg(windows)]
+const KERNEL_PROCESS_GUID: GUID = GUID::from_values(
+    0x22fb2cd6,
+    0x0e7b,
+    0x422b,
+    [0xa0, 0xc7, 0x2f, 0xad, 0x1f, 0xd0, 0xe7, 0x16],
+);
+
+/// Event ID for process start
+const EVENT_ID_PROCESS_START: u16 = 1;
+
+/// Keyword for process events
+#[cfg(windows)]
+const WINEVENT_KEYWORD_PROCESS: u64 = 0x10;
+
+/// Session name for our ETW trace
+const SESSION_NAME: &str = "SwiftTunnelSDKProcessWatcher";
+
+/// Event sent when a new process is detected
+#[derive(Debug, Clone)]
+pub struct ProcessStartEvent {
+    /// Process ID of the new process
+    pub pid: u32,
+    /// Process name (just the exe name, not full path)
+    pub name: String,
+    /// Full image path (NT path format)
+    pub image_path: String,
+    /// Parent process ID
+    pub parent_pid: u32,
+}
+
+/// ETW Process Watcher
+///
+/// Monitors for process creation events in real-time using ETW.
+/// When a process matching the watch list starts, sends notification
+/// via channel for immediate action.
+pub struct ProcessWatcher {
+    /// Channel to receive process start events
+    receiver: Receiver<ProcessStartEvent>,
+    /// Handle to stop the watcher
+    stop_flag: Arc<AtomicBool>,
+    /// Thread handle
+    thread_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProcessWatcher {
+    /// Create and start a new process watcher
+    #[cfg(windows)]
+    pub fn start(watch_list: HashSet<String>) -> Result<Self, String> {
+        let (sender, receiver) = bounded(100);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_flag_clone = stop_flag.clone();
+        let watch_list = Arc::new(RwLock::new(watch_list));
+        let watch_list_clone = watch_list.clone();
+
+        let thread_handle = std::thread::Builder::new()
+            .name("etw-process-watcher".to_string())
+            .spawn(move || {
+                if let Err(e) = run_etw_session(sender, stop_flag_clone, watch_list_clone) {
+                    log::error!("ETW process watcher failed: {}", e);
+                }
+            })
+            .map_err(|e| format!("Failed to spawn ETW thread: {}", e))?;
+
+        Ok(Self {
+            receiver,
+            stop_flag,
+            thread_handle: Some(thread_handle),
+        })
+    }
+
+    #[cfg(not(windows))]
+    pub fn start(_watch_list: HashSet<String>) -> Result<Self, String> {
+        let (_sender, receiver) = bounded(100);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        Ok(Self {
+            receiver,
+            stop_flag,
+            thread_handle: None,
+        })
+    }
+
+    /// Get the receiver for process events
+    pub fn receiver(&self) -> &Receiver<ProcessStartEvent> {
+        &self.receiver
+    }
+
+    /// Try to receive a process event without blocking
+    pub fn try_recv(&self) -> Option<ProcessStartEvent> {
+        self.receiver.try_recv().ok()
+    }
+
+    /// Stop the watcher
+    pub fn stop(&mut self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
+        #[cfg(windows)]
+        stop_existing_session();
+        if let Some(handle) = self.thread_handle.take() {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for ProcessWatcher {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Run the ETW session (called from background thread)
+#[cfg(windows)]
+fn run_etw_session(
+    sender: Sender<ProcessStartEvent>,
+    stop_flag: Arc<AtomicBool>,
+    watch_list: Arc<RwLock<HashSet<String>>>,
+) -> Result<(), String> {
+    log::info!("Starting ETW process watcher...");
+
+    stop_existing_session();
+
+    unsafe {
+        let session_name_wide: Vec<u16> = SESSION_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+        let properties_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + (session_name_wide.len() * 2) + 2;
+        let mut properties_buffer = vec![0u8; properties_size];
+        let properties = properties_buffer.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
+
+        (*properties).Wnode.BufferSize = properties_size as u32;
+        (*properties).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+        (*properties).Wnode.ClientContext = 1;
+        (*properties).LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+        (*properties).EnableFlags = EVENT_TRACE_FLAG_PROCESS;
+        (*properties).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+
+        let name_dest = (properties as *mut u8).add((*properties).LoggerNameOffset as usize) as *mut u16;
+        std::ptr::copy_nonoverlapping(session_name_wide.as_ptr(), name_dest, session_name_wide.len());
+
+        let mut session_handle = CONTROLTRACE_HANDLE::default();
+        let result = StartTraceW(
+            &mut session_handle,
+            PCWSTR(session_name_wide.as_ptr()),
+            properties,
+        );
+
+        if result != ERROR_SUCCESS {
+            return Err(format!("StartTraceW failed: 0x{:08X}", result.0));
+        }
+
+        log::info!("ETW session started, handle: {:?}", session_handle);
+
+        let result = EnableTraceEx2(
+            session_handle,
+            &KERNEL_PROCESS_GUID,
+            EVENT_CONTROL_CODE_ENABLE_PROVIDER.0,
+            TRACE_LEVEL_INFORMATION as u8,
+            WINEVENT_KEYWORD_PROCESS,
+            0,
+            0,
+            None,
+        );
+
+        if result != ERROR_SUCCESS {
+            ControlTraceW(
+                session_handle,
+                PCWSTR::null(),
+                properties,
+                EVENT_TRACE_CONTROL_STOP,
+            );
+            return Err(format!("EnableTraceEx2 failed: 0x{:08X}", result.0));
+        }
+
+        log::info!("ETW provider enabled");
+
+        let context = Box::new(CallbackContext {
+            sender: sender.clone(),
+            stop_flag: stop_flag.clone(),
+            watch_list: watch_list.clone(),
+        });
+        let context_ptr = Box::into_raw(context);
+
+        let mut logfile = EVENT_TRACE_LOGFILEW::default();
+        logfile.LoggerName = PWSTR(session_name_wide.as_ptr() as *mut u16);
+        logfile.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+        logfile.Anonymous2.EventRecordCallback = Some(event_record_callback);
+        logfile.Context = context_ptr as *mut c_void;
+
+        let trace_handle = OpenTraceW(&mut logfile);
+        if trace_handle.Value == u64::MAX {
+            let _ = Box::from_raw(context_ptr);
+            ControlTraceW(
+                session_handle,
+                PCWSTR::null(),
+                properties,
+                EVENT_TRACE_CONTROL_STOP,
+            );
+            return Err("OpenTraceW failed".to_string());
+        }
+
+        log::info!("ETW trace opened, processing events...");
+
+        let handles = [trace_handle];
+        let result = ProcessTrace(&handles, None, None);
+
+        CloseTrace(trace_handle);
+        let _ = Box::from_raw(context_ptr);
+
+        ControlTraceW(
+            session_handle,
+            PCWSTR::null(),
+            properties,
+            EVENT_TRACE_CONTROL_STOP,
+        );
+
+        if result != ERROR_SUCCESS && !stop_flag.load(Ordering::SeqCst) {
+            return Err(format!("ProcessTrace failed: 0x{:08X}", result.0));
+        }
+    }
+
+    log::info!("ETW process watcher stopped");
+    Ok(())
+}
+
+/// Stop any existing ETW session with our name
+#[cfg(windows)]
+fn stop_existing_session() {
+    unsafe {
+        let session_name_wide: Vec<u16> = SESSION_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+        let properties_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + (session_name_wide.len() * 2) + 2;
+        let mut properties_buffer = vec![0u8; properties_size];
+        let properties = properties_buffer.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
+
+        (*properties).Wnode.BufferSize = properties_size as u32;
+        (*properties).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+
+        let name_dest = (properties as *mut u8).add((*properties).LoggerNameOffset as usize) as *mut u16;
+        std::ptr::copy_nonoverlapping(session_name_wide.as_ptr(), name_dest, session_name_wide.len());
+
+        let result = ControlTraceW(
+            CONTROLTRACE_HANDLE::default(),
+            PCWSTR(session_name_wide.as_ptr()),
+            properties,
+            EVENT_TRACE_CONTROL_STOP,
+        );
+
+        if result == ERROR_SUCCESS {
+            log::info!("Stopped existing ETW session");
+        }
+    }
+}
+
+/// Context passed to ETW callback
+#[cfg(windows)]
+struct CallbackContext {
+    sender: Sender<ProcessStartEvent>,
+    stop_flag: Arc<AtomicBool>,
+    watch_list: Arc<RwLock<HashSet<String>>>,
+}
+
+/// ETW event callback - called for each event
+#[cfg(windows)]
+unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD) {
+    if event_record.is_null() {
+        return;
+    }
+
+    let record = &*event_record;
+    let context = record.UserContext as *mut CallbackContext;
+    if context.is_null() {
+        return;
+    }
+    let ctx = &*context;
+
+    if ctx.stop_flag.load(Ordering::Relaxed) {
+        return;
+    }
+
+    if record.EventHeader.ProviderId != KERNEL_PROCESS_GUID {
+        return;
+    }
+    if record.EventHeader.EventDescriptor.Id != EVENT_ID_PROCESS_START {
+        return;
+    }
+
+    if let Some(event) = parse_process_start_event(record) {
+        let name_lower = event.name.to_lowercase();
+        let watch_list = ctx.watch_list.read();
+
+        let should_notify = watch_list.iter().any(|app| {
+            let app_stem = app.trim_end_matches(".exe");
+            let name_stem = name_lower.trim_end_matches(".exe");
+            app_stem == name_stem
+        });
+
+        if should_notify {
+            log::info!(
+                "ETW detected watched process: {} (PID: {}, Parent: {})",
+                event.name, event.pid, event.parent_pid
+            );
+
+            // Fire callback to notify host application
+            crate::callbacks::fire_process_detected(&event.name, true);
+
+            let _ = ctx.sender.try_send(event);
+        }
+    }
+}
+
+/// Parse process start event from EVENT_RECORD
+#[cfg(windows)]
+unsafe fn parse_process_start_event(record: &EVENT_RECORD) -> Option<ProcessStartEvent> {
+    let user_data = record.UserData;
+    let user_data_len = record.UserDataLength as usize;
+
+    if user_data.is_null() || user_data_len < 16 {
+        return None;
+    }
+
+    let data = std::slice::from_raw_parts(user_data as *const u8, user_data_len);
+
+    if data.len() < 36 {
+        return None;
+    }
+
+    let event_pid = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+    let parent_pid = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+
+    // Find the image filename after the variable-length SID
+    let mut offset = 36usize;
+
+    if offset + 1 < data.len() {
+        let sub_auth_count = data[offset + 1] as usize;
+        let sid_size = 8 + (4 * sub_auth_count);
+        offset += sid_size;
+    }
+
+    let mut name = String::new();
+    if offset < data.len() {
+        for &byte in &data[offset..] {
+            if byte == 0 {
+                break;
+            }
+            name.push(byte as char);
+        }
+    }
+
+    let image_path = get_process_name_by_pid(event_pid).unwrap_or_default();
+
+    if name.is_empty() {
+        name = image_path.rsplit('\\').next().unwrap_or("unknown").to_string();
+    }
+
+    let short_name = name.rsplit('\\').next().unwrap_or(&name).to_string();
+
+    Some(ProcessStartEvent {
+        pid: event_pid,
+        name: short_name,
+        image_path,
+        parent_pid,
+    })
+}
+
+/// Get process name by PID using Windows API
+#[cfg(windows)]
+fn get_process_name_by_pid(pid: u32) -> Option<String> {
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows::Win32::System::ProcessStatus::GetProcessImageFileNameW;
+    use windows::Win32::Foundation::CloseHandle;
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        if handle.is_invalid() {
+            return None;
+        }
+
+        let mut buffer = [0u16; 260];
+        let len = GetProcessImageFileNameW(handle, &mut buffer);
+        CloseHandle(handle).ok();
+
+        if len == 0 {
+            return None;
+        }
+
+        let path = String::from_utf16_lossy(&buffer[..len as usize]);
+        let name = path.rsplit('\\').next().unwrap_or(&path);
+        Some(name.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_process_start_event() {
+        let event = ProcessStartEvent {
+            pid: 1234,
+            name: "RobloxPlayerBeta.exe".to_string(),
+            image_path: r"\Device\HarddiskVolume3\Users\test\AppData\Local\Roblox\Versions\version-xxx\RobloxPlayerBeta.exe".to_string(),
+            parent_pid: 5678,
+        };
+        assert_eq!(event.pid, 1234);
+        assert_eq!(event.name, "RobloxPlayerBeta.exe");
+        assert!(event.image_path.contains("RobloxPlayerBeta.exe"));
+    }
+}
