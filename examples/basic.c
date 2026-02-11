@@ -39,6 +39,7 @@ int          swifttunnel_servers_ping(const char* region);
 
 /* Connection */
 int          swifttunnel_connect(const char* region, const char* apps_json);
+int          swifttunnel_connect_ex(const char* options_json);
 int          swifttunnel_disconnect(void);
 int          swifttunnel_get_state(void);
 char*        swifttunnel_get_state_json(void);
@@ -46,15 +47,18 @@ char*        swifttunnel_get_state_json(void);
 /* Split Tunnel */
 char*        swifttunnel_get_tunneled_processes(void);
 char*        swifttunnel_get_stats_json(void);
+char*        swifttunnel_get_auto_routing_json(void);
 int          swifttunnel_refresh_processes(void);
 
 /* Callbacks */
 typedef void (*state_change_cb)(int state_code, void* ctx);
 typedef void (*error_cb)(int error_code, const char* message, void* ctx);
 typedef void (*process_detected_cb)(const char* name, int added, void* ctx);
+typedef void (*auto_routing_cb)(const char* event_json, void* ctx);
 void         swifttunnel_on_state_change(state_change_cb cb, void* ctx);
 void         swifttunnel_on_error(error_cb cb, void* ctx);
 void         swifttunnel_on_process_detected(process_detected_cb cb, void* ctx);
+void         swifttunnel_on_auto_routing_event(auto_routing_cb cb, void* ctx);
 
 /* Error */
 char*        swifttunnel_get_last_error(void);
@@ -77,6 +81,11 @@ static void on_process(const char* name, int added, void* ctx) {
     (void)ctx;
     printf("[callback] process %s: %s\n", added ? "added" : "removed",
            name ? name : "(null)");
+}
+
+static void on_auto_routing(const char* event_json, void* ctx) {
+    (void)ctx;
+    printf("[callback] auto-routing: %s\n", event_json ? event_json : "(null)");
 }
 
 /* ── Helpers ────────────────────────────────────────────────────────────── */
@@ -108,6 +117,7 @@ int main(int argc, char** argv) {
     swifttunnel_on_state_change(on_state, NULL);
     swifttunnel_on_error(on_error, NULL);
     swifttunnel_on_process_detected(on_process, NULL);
+    swifttunnel_on_auto_routing_event(on_auto_routing, NULL);
 
     /* 3. Authenticate */
     rc = swifttunnel_auth_sign_in(email, password);
@@ -129,8 +139,16 @@ int main(int argc, char** argv) {
         printf("ping %s: %d ms\n", region, latency);
     }
 
-    /* 5. Connect */
-    rc = swifttunnel_connect(region, "[\"RobloxPlayerBeta.exe\"]");
+    /* 5. Connect using connect_ex with auto-routing enabled */
+    char connect_opts[512];
+    snprintf(
+        connect_opts,
+        sizeof(connect_opts),
+        "{\"region\":\"%s\",\"apps\":[\"RobloxPlayerBeta.exe\"],"
+        "\"auto_routing\":{\"enabled\":true,\"whitelisted_regions\":[\"US East\",\"Tokyo\"]}}",
+        region
+    );
+    rc = swifttunnel_connect_ex(connect_opts);
     if (rc != 0) {
         print_and_free("connect error", swifttunnel_get_last_error());
         swifttunnel_cleanup();
@@ -141,6 +159,7 @@ int main(int argc, char** argv) {
     print_and_free("state detail", swifttunnel_get_state_json());
     print_and_free("tunneled", swifttunnel_get_tunneled_processes());
     print_and_free("stats", swifttunnel_get_stats_json());
+    print_and_free("auto routing", swifttunnel_get_auto_routing_json());
 
     /* 6. Disconnect */
     rc = swifttunnel_disconnect();

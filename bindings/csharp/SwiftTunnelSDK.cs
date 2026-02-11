@@ -23,6 +23,9 @@ namespace SwiftTunnel
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate void ProcessDetectedCallback(IntPtr processName, int added, IntPtr ctx);
 
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate void AutoRoutingEventCallback(IntPtr eventJson, IntPtr ctx);
+
     // ── Raw P/Invoke declarations ──────────────────────────────────────────
 
     public static class SwiftTunnelNative
@@ -87,6 +90,10 @@ namespace SwiftTunnel
             [MarshalAs(UnmanagedType.LPUTF8Str)] string appsJson);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int swifttunnel_connect_ex(
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string optionsJson);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         public static extern int swifttunnel_disconnect();
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -103,6 +110,9 @@ namespace SwiftTunnel
         public static extern IntPtr swifttunnel_get_stats_json();
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr swifttunnel_get_auto_routing_json();
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         public static extern int swifttunnel_refresh_processes();
 
         // Callbacks (3)
@@ -117,6 +127,10 @@ namespace SwiftTunnel
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         public static extern void swifttunnel_on_process_detected(
             ProcessDetectedCallback? cb, IntPtr ctx);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void swifttunnel_on_auto_routing_event(
+            AutoRoutingEventCallback? cb, IntPtr ctx);
 
         // Error (3)
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -139,6 +153,7 @@ namespace SwiftTunnel
         private StateChangeCallback? _stateCallback;
         private ErrorCallback? _errorCallback;
         private ProcessDetectedCallback? _processCallback;
+        private AutoRoutingEventCallback? _autoRoutingCallback;
 
         public SwiftTunnelClient()
         {
@@ -156,9 +171,11 @@ namespace SwiftTunnel
                 SwiftTunnelNative.swifttunnel_on_state_change(null, IntPtr.Zero);
                 SwiftTunnelNative.swifttunnel_on_error(null, IntPtr.Zero);
                 SwiftTunnelNative.swifttunnel_on_process_detected(null, IntPtr.Zero);
+                SwiftTunnelNative.swifttunnel_on_auto_routing_event(null, IntPtr.Zero);
                 _stateCallback = null;
                 _errorCallback = null;
                 _processCallback = null;
+                _autoRoutingCallback = null;
 
                 SwiftTunnelNative.swifttunnel_cleanup();
             }
@@ -285,6 +302,11 @@ namespace SwiftTunnel
             Check(SwiftTunnelNative.swifttunnel_connect(region, appsJson));
         }
 
+        public void ConnectEx(string optionsJson)
+        {
+            Check(SwiftTunnelNative.swifttunnel_connect_ex(optionsJson));
+        }
+
         public void Disconnect()
         {
             Check(SwiftTunnelNative.swifttunnel_disconnect());
@@ -312,6 +334,11 @@ namespace SwiftTunnel
         public string? StatsJson
         {
             get => ConsumeString(SwiftTunnelNative.swifttunnel_get_stats_json());
+        }
+
+        public string? AutoRoutingJson
+        {
+            get => ConsumeString(SwiftTunnelNative.swifttunnel_get_auto_routing_json());
         }
 
         public void RefreshProcesses()
@@ -370,6 +397,25 @@ namespace SwiftTunnel
                 handler(name, added != 0);
             };
             SwiftTunnelNative.swifttunnel_on_process_detected(_processCallback, IntPtr.Zero);
+        }
+
+        public void OnAutoRoutingEvent(Action<string>? handler)
+        {
+            if (handler == null)
+            {
+                _autoRoutingCallback = null;
+                SwiftTunnelNative.swifttunnel_on_auto_routing_event(null, IntPtr.Zero);
+                return;
+            }
+
+            _autoRoutingCallback = (jsonPtr, _) =>
+            {
+                string payload = jsonPtr != IntPtr.Zero
+                    ? Marshal.PtrToStringUTF8(jsonPtr) ?? ""
+                    : "";
+                handler(payload);
+            };
+            SwiftTunnelNative.swifttunnel_on_auto_routing_event(_autoRoutingCallback, IntPtr.Zero);
         }
     }
 

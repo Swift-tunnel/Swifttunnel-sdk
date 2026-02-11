@@ -115,6 +115,9 @@ def _load_lib() -> CDLL:
     lib.swifttunnel_connect.argtypes = [c_char_p, c_char_p]
     lib.swifttunnel_connect.restype = c_int
 
+    lib.swifttunnel_connect_ex.argtypes = [c_char_p]
+    lib.swifttunnel_connect_ex.restype = c_int
+
     lib.swifttunnel_disconnect.argtypes = []
     lib.swifttunnel_disconnect.restype = c_int
 
@@ -131,6 +134,9 @@ def _load_lib() -> CDLL:
     lib.swifttunnel_get_stats_json.argtypes = []
     lib.swifttunnel_get_stats_json.restype = c_void_p
 
+    lib.swifttunnel_get_auto_routing_json.argtypes = []
+    lib.swifttunnel_get_auto_routing_json.restype = c_void_p
+
     lib.swifttunnel_refresh_processes.argtypes = []
     lib.swifttunnel_refresh_processes.restype = c_int
 
@@ -138,6 +144,7 @@ def _load_lib() -> CDLL:
     STATE_CB = CFUNCTYPE(None, c_int, c_void_p)
     ERROR_CB = CFUNCTYPE(None, c_int, c_char_p, c_void_p)
     PROCESS_CB = CFUNCTYPE(None, c_char_p, c_int, c_void_p)
+    AUTO_ROUTING_CB = CFUNCTYPE(None, c_char_p, c_void_p)
 
     lib.swifttunnel_on_state_change.argtypes = [STATE_CB, c_void_p]
     lib.swifttunnel_on_state_change.restype = None
@@ -147,6 +154,9 @@ def _load_lib() -> CDLL:
 
     lib.swifttunnel_on_process_detected.argtypes = [PROCESS_CB, c_void_p]
     lib.swifttunnel_on_process_detected.restype = None
+
+    lib.swifttunnel_on_auto_routing_event.argtypes = [AUTO_ROUTING_CB, c_void_p]
+    lib.swifttunnel_on_auto_routing_event.restype = None
 
     # ── Error (3) ───────────────────────────────────────────────────────
     lib.swifttunnel_get_last_error.argtypes = []
@@ -165,8 +175,9 @@ def _load_lib() -> CDLL:
 # ── Callback CFUNCTYPE aliases ──────────────────────────────────────────────
 
 STATE_CB_TYPE = CFUNCTYPE(None, c_int, c_void_p)
-ERROR_CB_TYPE = CFUNCTYPE(None, c_char_p, c_int, c_void_p)
+ERROR_CB_TYPE = CFUNCTYPE(None, c_int, c_char_p, c_void_p)
 PROCESS_CB_TYPE = CFUNCTYPE(None, c_char_p, c_int, c_void_p)
+AUTO_ROUTING_CB_TYPE = CFUNCTYPE(None, c_char_p, c_void_p)
 
 
 # ── Exception ───────────────────────────────────────────────────────────────
@@ -213,6 +224,7 @@ class SwiftTunnel:
         self._state_cb = None
         self._error_cb = None
         self._process_cb = None
+        self._auto_routing_cb = None
         if auto_init:
             self.init()
 
@@ -231,6 +243,7 @@ class SwiftTunnel:
         self.on_state_change(None)
         self.on_error(None)
         self.on_process_detected(None)
+        self.on_auto_routing_event(None)
         self._lib.swifttunnel_cleanup()
 
     @property
@@ -316,6 +329,16 @@ class SwiftTunnel:
             ),
         )
 
+    def connect_ex(self, options: dict[str, Any] | str) -> None:
+        if isinstance(options, str):
+            payload = options
+        else:
+            payload = json.dumps(options)
+        _check(
+            self._lib,
+            self._lib.swifttunnel_connect_ex(payload.encode("utf-8")),
+        )
+
     def disconnect(self) -> None:
         _check(self._lib, self._lib.swifttunnel_disconnect())
 
@@ -342,6 +365,12 @@ class SwiftTunnel:
     @property
     def stats(self) -> dict | None:
         ptr = self._lib.swifttunnel_get_stats_json()
+        s = _consume_string(self._lib, ptr)
+        return json.loads(s) if s else None
+
+    @property
+    def auto_routing_json(self) -> dict | None:
+        ptr = self._lib.swifttunnel_get_auto_routing_json()
         s = _consume_string(self._lib, ptr)
         return json.loads(s) if s else None
 
@@ -398,6 +427,24 @@ class SwiftTunnel:
 
         self._process_cb = _cb
         self._lib.swifttunnel_on_process_detected(self._process_cb, None)
+
+    def on_auto_routing_event(
+        self, handler: Callable[[str], None] | None
+    ) -> None:
+        if handler is None:
+            self._auto_routing_cb = None
+            self._lib.swifttunnel_on_auto_routing_event(
+                ctypes.cast(None, AUTO_ROUTING_CB_TYPE), None
+            )
+            return
+
+        @AUTO_ROUTING_CB_TYPE
+        def _cb(event_ptr: bytes | None, _ctx: Any) -> None:
+            payload = event_ptr.decode("utf-8") if event_ptr else ""
+            handler(payload)
+
+        self._auto_routing_cb = _cb
+        self._lib.swifttunnel_on_auto_routing_event(self._auto_routing_cb, None)
 
     # ── Error ───────────────────────────────────────────────────────────
 

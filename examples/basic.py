@@ -37,6 +37,9 @@ def main() -> None:
                 f"[callback] process {'added' if added else 'removed'}: {name}"
             )
         )
+        sdk.on_auto_routing_event(
+            lambda payload: print(f"[callback] auto-routing: {payload}")
+        )
 
         # Authenticate
         try:
@@ -57,14 +60,24 @@ def main() -> None:
         except SwiftTunnelError as e:
             print(f"Servers error ({e.code}): {e}", file=sys.stderr)
 
-        # Connect with split tunnelling
+        # Connect with split tunnelling + auto-routing
         try:
-            sdk.connect(region, ["RobloxPlayerBeta.exe"])
+            sdk.connect_ex(
+                {
+                    "region": region,
+                    "apps": ["RobloxPlayerBeta.exe"],
+                    "auto_routing": {
+                        "enabled": True,
+                        "whitelisted_regions": ["US East", "Tokyo"],
+                    },
+                }
+            )
 
             print(f"State: {sdk.state}")
             print(f"State detail: {sdk.state_json}")
             print(f"Tunneled processes: {sdk.tunneled_processes}")
             print(f"Stats: {sdk.stats}")
+            print(f"Auto routing: {sdk.auto_routing_json}")
         except SwiftTunnelError as e:
             print(f"Connect failed ({e.code}): {e}", file=sys.stderr)
             return

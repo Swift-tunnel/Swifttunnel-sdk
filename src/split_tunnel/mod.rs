@@ -33,8 +33,8 @@ pub use process_cache::{LockFreeProcessCache, ProcessSnapshot};
 pub use process_tracker::{ConnectionKey, ProcessTracker, Protocol, TrackerStats};
 pub use process_watcher::{ProcessStartEvent, ProcessWatcher};
 
-use std::sync::Arc;
 use crate::error::SdkError;
+use std::sync::Arc;
 
 /// Combined split tunnel driver that orchestrates all components.
 ///
@@ -95,15 +95,26 @@ impl SplitTunnelDriver {
     /// Convenience method that clones the relay socket and extracts the
     /// session ID + address.
     pub fn relay_context_from_udp_relay(
-        relay: &crate::vpn::UdpRelay,
+        relay: &Arc<crate::vpn::UdpRelay>,
     ) -> Result<Arc<RelayForwardContext>, SdkError> {
-        let socket = relay.try_clone_socket()?;
-        let ctx = RelayForwardContext {
-            socket: Arc::new(socket),
-            relay_addr: relay.relay_addr(),
-            session_id: *relay.session_id_bytes(),
-        };
-        Ok(Arc::new(ctx))
+        Ok(Arc::new(RelayForwardContext {
+            relay: Arc::clone(relay),
+        }))
+    }
+
+    /// Set auto-router used for runtime relay switching + whitelist bypass.
+    pub fn set_auto_router(&mut self, router: Arc<crate::vpn::auto_routing::AutoRouter>) {
+        self.interceptor.set_auto_router(router);
+    }
+
+    /// Switch relay destination without restarting split tunnel.
+    pub fn switch_relay_addr(&self, new_addr: std::net::SocketAddr) -> bool {
+        self.interceptor.switch_relay_addr(new_addr)
+    }
+
+    /// Get current relay address.
+    pub fn current_relay_addr(&self) -> Option<std::net::SocketAddr> {
+        self.interceptor.current_relay_addr()
     }
 
     /// Start packet interception and the ETW process watcher.
@@ -217,9 +228,11 @@ impl SplitTunnelDriver {
             while let Some(event) = watcher.try_recv() {
                 log::info!(
                     "ETW event: {} (PID: {}) - registering immediately",
-                    event.name, event.pid
+                    event.name,
+                    event.pid
                 );
-                self.interceptor.register_process_immediate(event.pid, event.name);
+                self.interceptor
+                    .register_process_immediate(event.pid, event.name);
                 self.interceptor.trigger_refresh();
             }
         }

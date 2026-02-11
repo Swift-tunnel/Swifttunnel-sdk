@@ -49,7 +49,10 @@ use std::time::{Duration, Instant};
 
 use arrayvec::ArrayVec;
 
-use super::process_cache::{LockFreeProcessCache, ProcessSnapshot, is_likely_game_traffic, is_game_server};
+use super::process_cache::{
+    is_game_server, is_likely_game_traffic, is_roblox_game_server_ip, LockFreeProcessCache,
+    ProcessSnapshot,
+};
 use super::process_tracker::{ConnectionKey, Protocol};
 use crate::error::SdkError;
 
@@ -144,7 +147,8 @@ fn join_with_timeout(handle: JoinHandle<()>, name: &str) -> bool {
 
     log::error!(
         "{} thread did not stop within {:?} - detaching thread to prevent hang",
-        name, THREAD_JOIN_TIMEOUT
+        name,
+        THREAD_JOIN_TIMEOUT
     );
     std::mem::forget(handle);
     false
@@ -156,22 +160,12 @@ fn join_with_timeout(handle: JoinHandle<()>, name: &str) -> bool {
 /// The relay wraps packets as [session_id][payload] and forwards to server:51821.
 #[derive(Clone)]
 pub struct RelayForwardContext {
-    /// UDP socket for sending to relay server
-    pub socket: Arc<std::net::UdpSocket>,
-    /// Relay server address (server:51821)
-    pub relay_addr: std::net::SocketAddr,
-    /// 8-byte session ID for this connection
-    pub session_id: [u8; 8],
+    pub relay: Arc<crate::vpn::UdpRelay>,
 }
 
 impl RelayForwardContext {
-    /// Forward an IP packet to the relay server
-    /// Wraps as [session_id][ip_payload] and sends via UDP
-    pub fn forward(&self, ip_packet: &[u8]) -> std::io::Result<usize> {
-        let mut buf = Vec::with_capacity(8 + ip_packet.len());
-        buf.extend_from_slice(&self.session_id);
-        buf.extend_from_slice(ip_packet);
-        self.socket.send_to(&buf, self.relay_addr)
+    pub fn forward(&self, ip_packet: &[u8]) -> Result<usize, crate::error::SdkError> {
+        self.relay.forward_outbound(ip_packet)
     }
 }
 
@@ -216,6 +210,8 @@ pub struct ParallelInterceptor {
     inbound_receiver_handle: Option<JoinHandle<()>>,
     /// Flag to trigger immediate cache refresh (set by ETW)
     refresh_now_flag: Arc<AtomicBool>,
+    /// Auto-router for dynamic relay switching and whitelist bypass.
+    auto_router: Option<Arc<crate::vpn::auto_routing::AutoRouter>>,
 }
 
 impl ParallelInterceptor {
@@ -230,8 +226,9 @@ impl ParallelInterceptor {
             num_cpus::get(),
         );
 
-        let worker_stats: Vec<Arc<WorkerStats>> =
-            (0..num_workers).map(|_| Arc::new(WorkerStats::default())).collect();
+        let worker_stats: Vec<Arc<WorkerStats>> = (0..num_workers)
+            .map(|_| Arc::new(WorkerStats::default()))
+            .collect();
 
         Self {
             num_workers,
@@ -254,6 +251,7 @@ impl ParallelInterceptor {
             relay_ctx: None,
             inbound_receiver_handle: None,
             refresh_now_flag: Arc::new(AtomicBool::new(false)),
+            auto_router: None,
         }
     }
 
@@ -289,10 +287,30 @@ impl ParallelInterceptor {
     pub fn set_relay_context(&mut self, ctx: Arc<RelayForwardContext>) {
         log::info!(
             "Set relay context: server={}, session={:016x}",
-            ctx.relay_addr,
-            u64::from_be_bytes(ctx.session_id),
+            ctx.relay.relay_addr(),
+            ctx.relay.session_id_u64(),
         );
         self.relay_ctx = Some(ctx);
+    }
+
+    /// Switch relay address used by workers (auto-routing).
+    pub fn switch_relay_addr(&self, new_addr: std::net::SocketAddr) -> bool {
+        if let Some(ref relay) = self.relay_ctx {
+            relay.relay.switch_relay(new_addr);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get current relay address for diagnostics/comparison.
+    pub fn current_relay_addr(&self) -> Option<std::net::SocketAddr> {
+        self.relay_ctx.as_ref().map(|r| r.relay.relay_addr())
+    }
+
+    /// Set auto-router used in worker hot path.
+    pub fn set_auto_router(&mut self, router: Arc<crate::vpn::auto_routing::AutoRouter>) {
+        self.auto_router = Some(router);
     }
 
     /// Check if driver is available
@@ -312,7 +330,9 @@ impl ParallelInterceptor {
     /// Initialize interceptor
     pub fn initialize(&mut self) -> Result<(), SdkError> {
         if !Self::check_driver_available() {
-            return Err(SdkError::SplitTunnel("Windows Packet Filter driver not available".to_string()));
+            return Err(SdkError::SplitTunnel(
+                "Windows Packet Filter driver not available".to_string(),
+            ));
         }
         log::info!("Parallel interceptor initialized");
         Ok(())
@@ -346,7 +366,10 @@ impl ParallelInterceptor {
                         let delay = RETRY_DELAYS_MS[attempt as usize - 1];
                         log::warn!(
                             "Adapter detection failed (attempt {}/{}): {}. Retrying in {}ms...",
-                            attempt, MAX_RETRIES, e, delay
+                            attempt,
+                            MAX_RETRIES,
+                            e,
+                            delay
                         );
                         std::thread::sleep(Duration::from_millis(delay));
                     }
@@ -384,7 +407,9 @@ impl ParallelInterceptor {
 
             log::info!(
                 "  Adapter {}: '{}' (internal: {})",
-                idx, friendly_name, internal_name
+                idx,
+                friendly_name,
+                internal_name
             );
 
             let name_lower = internal_name.to_lowercase();
@@ -411,11 +436,10 @@ impl ParallelInterceptor {
                 || friendly_lower.contains("mullvad")
                 || friendly_lower.contains("private internet")
                 || friendly_lower.contains("cyberghost")
-                || (!friendly_lower.is_empty() && (
-                    friendly_lower.contains("virtual")
-                    || friendly_lower.contains("vpn")
-                    || friendly_lower.contains("tunnel")
-                ));
+                || (!friendly_lower.is_empty()
+                    && (friendly_lower.contains("virtual")
+                        || friendly_lower.contains("vpn")
+                        || friendly_lower.contains("tunnel")));
 
             if is_virtual || friendly_name.is_empty() {
                 log::info!("    -> Skipped");
@@ -432,12 +456,17 @@ impl ParallelInterceptor {
             if has_default_route {
                 score += 1000;
             }
-            if friendly_lower.contains("ethernet") || friendly_lower.contains("intel")
-                || friendly_lower.contains("realtek") || friendly_lower.contains("broadcom") {
+            if friendly_lower.contains("ethernet")
+                || friendly_lower.contains("intel")
+                || friendly_lower.contains("realtek")
+                || friendly_lower.contains("broadcom")
+            {
                 score += 100;
             }
-            if friendly_lower.contains("wi-fi") || friendly_lower.contains("wifi")
-                || friendly_lower.contains("wireless") {
+            if friendly_lower.contains("wi-fi")
+                || friendly_lower.contains("wifi")
+                || friendly_lower.contains("wireless")
+            {
                 score += 80;
             }
             if !friendly_name.is_empty() {
@@ -446,7 +475,12 @@ impl ParallelInterceptor {
             score += (10 - idx.min(10)) as i32;
 
             log::info!("    -> Physical candidate (score: {})", score);
-            physical_candidates.push((idx, friendly_name.clone(), internal_name.to_string(), score));
+            physical_candidates.push((
+                idx,
+                friendly_name.clone(),
+                internal_name.to_string(),
+                score,
+            ));
         }
 
         let selected = physical_candidates.iter().max_by_key(|x| x.3);
@@ -455,9 +489,15 @@ impl ParallelInterceptor {
             self.physical_adapter_idx = Some(*idx);
             self.physical_adapter_name = Some(internal_name.clone());
             self.physical_adapter_friendly_name = Some(friendly_name.clone());
-            log::info!("Selected physical adapter: {} (index {})", friendly_name, idx);
+            log::info!(
+                "Selected physical adapter: {} (index {})",
+                friendly_name,
+                idx
+            );
         } else {
-            return Err(SdkError::SplitTunnel("No physical adapter found".to_string()));
+            return Err(SdkError::SplitTunnel(
+                "No physical adapter found".to_string(),
+            ));
         }
 
         Ok(())
@@ -466,13 +506,15 @@ impl ParallelInterceptor {
     /// Get the interface index that has the default route (0.0.0.0/0)
     #[cfg(windows)]
     fn get_default_route_interface_index() -> Option<u32> {
-        use windows::Win32::NetworkManagement::IpHelper::*;
         use windows::Win32::Foundation::*;
+        use windows::Win32::NetworkManagement::IpHelper::*;
 
         unsafe {
             let mut size: u32 = 0;
             let _ = GetIpForwardTable(None, &mut size, false);
-            if size == 0 { return None; }
+            if size == 0 {
+                return None;
+            }
 
             let mut buffer = vec![0u8; size as usize];
             let table = buffer.as_mut_ptr() as *mut MIB_IPFORWARDTABLE;
@@ -513,13 +555,28 @@ impl ParallelInterceptor {
 
         unsafe {
             let mut size: u32 = 0;
-            let _ = GetAdaptersAddresses(AF_INET.0 as u32, GAA_FLAG_INCLUDE_PREFIX, None, None, &mut size);
-            if size == 0 { return None; }
+            let _ = GetAdaptersAddresses(
+                AF_INET.0 as u32,
+                GAA_FLAG_INCLUDE_PREFIX,
+                None,
+                None,
+                &mut size,
+            );
+            if size == 0 {
+                return None;
+            }
 
             let mut buffer = vec![0u8; size as usize];
             let adapter_addresses = buffer.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
 
-            if GetAdaptersAddresses(AF_INET.0 as u32, GAA_FLAG_INCLUDE_PREFIX, None, Some(adapter_addresses), &mut size) != 0 {
+            if GetAdaptersAddresses(
+                AF_INET.0 as u32,
+                GAA_FLAG_INCLUDE_PREFIX,
+                None,
+                Some(adapter_addresses),
+                &mut size,
+            ) != 0
+            {
                 return None;
             }
 
@@ -528,7 +585,10 @@ impl ParallelInterceptor {
                 let adapter = &*current;
                 let name = adapter.AdapterName.to_string().unwrap_or_default();
                 let guid_from_adapter = adapter_guid.trim_start_matches("\\DEVICE\\");
-                if guid_from_adapter == name || guid_from_adapter.trim_matches('{').trim_matches('}') == name.trim_matches('{').trim_matches('}') {
+                if guid_from_adapter == name
+                    || guid_from_adapter.trim_matches('{').trim_matches('}')
+                        == name.trim_matches('{').trim_matches('}')
+                {
                     return Some(adapter.Anonymous1.Anonymous.IfIndex);
                 }
                 current = adapter.Next;
@@ -622,7 +682,9 @@ impl ParallelInterceptor {
     /// Re-enable TSO/LSO on the physical adapter
     #[cfg(windows)]
     pub fn enable_adapter_offload(&mut self) {
-        if !self.tso_was_disabled { return; }
+        if !self.tso_was_disabled {
+            return;
+        }
 
         let friendly_name = match &self.physical_adapter_friendly_name {
             Some(name) => name.clone(),
@@ -686,7 +748,9 @@ impl ParallelInterceptor {
     /// Re-enable IPv6 on the physical adapter
     #[cfg(windows)]
     pub fn enable_ipv6(&mut self) {
-        if !self.ipv6_was_disabled { return; }
+        if !self.ipv6_was_disabled {
+            return;
+        }
 
         let friendly_name = match &self.physical_adapter_friendly_name {
             Some(name) => name.clone(),
@@ -721,7 +785,10 @@ impl ParallelInterceptor {
             .physical_adapter_idx
             .ok_or_else(|| SdkError::SplitTunnel("Physical adapter not configured".to_string()))?;
 
-        log::info!("Starting parallel interceptor with {} workers", self.num_workers);
+        log::info!(
+            "Starting parallel interceptor with {} workers",
+            self.num_workers
+        );
 
         self.disable_adapter_offload()?;
         self.disable_ipv6()?;
@@ -750,6 +817,7 @@ impl ParallelInterceptor {
             let stats = Arc::clone(&self.worker_stats[worker_id]);
             let throughput = self.throughput_stats.clone();
             let relay_ctx = self.relay_ctx.clone();
+            let auto_router = self.auto_router.clone();
 
             let handle = thread::spawn(move || {
                 set_thread_affinity(worker_id);
@@ -761,6 +829,7 @@ impl ParallelInterceptor {
                     throughput,
                     stop_flag,
                     relay_ctx,
+                    auto_router,
                 );
             });
 
@@ -770,14 +839,19 @@ impl ParallelInterceptor {
         // Start packet reader/dispatcher thread
         let reader_stop = Arc::clone(&self.stop_flag);
         let num_workers = self.num_workers;
-        let physical_name = Arc::new(
-            self.physical_adapter_name
-                .clone()
-                .ok_or_else(|| SdkError::SplitTunnel("Physical adapter name not set".to_string()))?
-        );
+        let physical_name =
+            Arc::new(self.physical_adapter_name.clone().ok_or_else(|| {
+                SdkError::SplitTunnel("Physical adapter name not set".to_string())
+            })?);
 
         self.reader_handle = Some(thread::spawn(move || {
-            if let Err(e) = run_packet_reader(physical_idx, physical_name, senders, reader_stop, num_workers) {
+            if let Err(e) = run_packet_reader(
+                physical_idx,
+                physical_name,
+                senders,
+                reader_stop,
+                num_workers,
+            ) {
                 log::error!("Packet reader error: {}", e);
             }
         }));
@@ -829,8 +903,13 @@ impl ParallelInterceptor {
         let tunneled = self.total_tunneled.load(Ordering::Relaxed);
         log::info!(
             "Parallel interceptor stopped - {} total, {} tunneled ({:.1}%)",
-            total, tunneled,
-            if total > 0 { (tunneled as f64 / total as f64) * 100.0 } else { 0.0 }
+            total,
+            tunneled,
+            if total > 0 {
+                (tunneled as f64 / total as f64) * 100.0
+            } else {
+                0.0
+            }
         );
 
         self.enable_adapter_offload();
@@ -910,7 +989,9 @@ fn run_packet_reader(
 
     log::info!(
         "Packet reader started (physical idx: {}, name: '{}', {} workers)",
-        physical_idx, physical_name, num_workers
+        physical_idx,
+        physical_name,
+        num_workers
     );
 
     let driver = ndisapi::Ndisapi::new("NDISRD")
@@ -921,7 +1002,9 @@ fn run_packet_reader(
         .map_err(|e| SdkError::SplitTunnel(format!("Failed to get adapters: {}", e)))?;
 
     if physical_idx >= adapters.len() {
-        return Err(SdkError::SplitTunnel("Physical adapter index out of range".to_string()));
+        return Err(SdkError::SplitTunnel(
+            "Physical adapter index out of range".to_string(),
+        ));
     }
 
     let physical_handle = adapters[physical_idx].get_handle();
@@ -956,7 +1039,9 @@ fn run_packet_reader(
         let packets_read = driver.read_packets::<BATCH_SIZE>(&mut to_read).unwrap_or(0);
 
         if packets_read == 0 {
-            unsafe { let _ = ResetEvent(event); }
+            unsafe {
+                let _ = ResetEvent(event);
+            }
             continue;
         }
 
@@ -1004,11 +1089,15 @@ fn run_packet_reader(
             let _ = driver.send_packets_to_mstcp::<BATCH_SIZE>(&passthrough_to_mstcp);
         }
 
-        unsafe { let _ = ResetEvent(event); }
+        unsafe {
+            let _ = ResetEvent(event);
+        }
     }
 
     let _ = driver.set_adapter_mode(physical_handle, FilterFlags::default());
-    unsafe { let _ = CloseHandle(event); }
+    unsafe {
+        let _ = CloseHandle(event);
+    }
 
     log::info!("Packet reader stopped");
     Ok(())
@@ -1023,6 +1112,7 @@ fn run_packet_worker(
     throughput: ThroughputStats,
     stop_flag: Arc<AtomicBool>,
     relay_ctx: Option<Arc<RelayForwardContext>>,
+    auto_router: Option<Arc<crate::vpn::auto_routing::AutoRouter>>,
 ) {
     log::info!("Worker {} started", worker_id);
 
@@ -1089,16 +1179,48 @@ fn run_packet_worker(
 
         if work.is_outbound {
             let should_tunnel = should_route_to_relay(&work.data, &snapshot, &mut inline_cache);
+            let auto_routing_bypass =
+                should_tunnel && auto_router.as_ref().map_or(false, |r| r.is_bypassed());
 
-            if should_tunnel {
-                stats.packets_tunneled.fetch_add(1, Ordering::Relaxed);
-                stats.bytes_tunneled.fetch_add(packet_len, Ordering::Relaxed);
-                throughput.add_tx(packet_len);
+            if auto_routing_bypass && work.data.len() >= 14 + 20 {
+                let ip_start = 14;
+                let dst_ip = Ipv4Addr::new(
+                    work.data[ip_start + 16],
+                    work.data[ip_start + 17],
+                    work.data[ip_start + 18],
+                    work.data[ip_start + 19],
+                );
+                if is_roblox_game_server_ip(dst_ip) {
+                    if let Some(ref ar) = auto_router {
+                        ar.evaluate_game_server(dst_ip);
+                    }
+                }
+            }
 
+            if should_tunnel && !auto_routing_bypass {
                 if work.data.len() <= 14 {
                     continue;
                 }
                 let ip_packet = &work.data[14..];
+
+                if ip_packet.len() >= 20 {
+                    let dst_ip =
+                        Ipv4Addr::new(ip_packet[16], ip_packet[17], ip_packet[18], ip_packet[19]);
+                    if is_roblox_game_server_ip(dst_ip) {
+                        if let Some(ref ar) = auto_router {
+                            ar.evaluate_game_server(dst_ip);
+                            if ar.is_lookup_pending(dst_ip) {
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                stats.packets_tunneled.fetch_add(1, Ordering::Relaxed);
+                stats
+                    .bytes_tunneled
+                    .fetch_add(packet_len, Ordering::Relaxed);
+                throughput.add_tx(packet_len);
 
                 // Fix checksums before forwarding
                 let mut pkt_buf = ip_packet.to_vec();
@@ -1110,7 +1232,11 @@ fn run_packet_worker(
                         Ok(_) => {
                             relay_success += 1;
                             if relay_success <= 5 {
-                                log::info!("Worker {}: V3 relay forward OK - {} bytes", worker_id, pkt_buf.len());
+                                log::info!(
+                                    "Worker {}: V3 relay forward OK - {} bytes",
+                                    worker_id,
+                                    pkt_buf.len()
+                                );
                             }
                         }
                         Err(e) => {
@@ -1126,7 +1252,9 @@ fn run_packet_worker(
                 }
             } else {
                 stats.packets_bypassed.fetch_add(1, Ordering::Relaxed);
-                stats.bytes_bypassed.fetch_add(packet_len, Ordering::Relaxed);
+                stats
+                    .bytes_bypassed
+                    .fetch_add(packet_len, Ordering::Relaxed);
                 send_bypass_packet(&driver, &adapters, &work);
             }
         }
@@ -1149,7 +1277,10 @@ fn send_bypass_packet(
 ) {
     use ndisapi::{DirectionFlags, EthMRequest, IntermediateBuffer};
 
-    let adapter = match adapters.iter().find(|a| a.get_name() == work.physical_adapter_name.as_str()) {
+    let adapter = match adapters
+        .iter()
+        .find(|a| a.get_name() == work.physical_adapter_name.as_str())
+    {
         Some(a) => a,
         None => return,
     };
@@ -1185,7 +1316,10 @@ fn run_cache_refresher(
     log::info!("Cache refresher started (event-driven + 2s fallback)");
 
     let tunnel_apps = cache.tunnel_apps();
-    log::info!("Cache refresher: tunnel_apps = {:?}", tunnel_apps.iter().take(5).collect::<Vec<_>>());
+    log::info!(
+        "Cache refresher: tunnel_apps = {:?}",
+        tunnel_apps.iter().take(5).collect::<Vec<_>>()
+    );
 
     let mut refresh_count = 0u64;
     let mut first_run = true;
@@ -1224,10 +1358,25 @@ fn run_cache_refresher(
         #[cfg(windows)]
         unsafe {
             let mut size: u32 = 0;
-            let _ = GetExtendedTcpTable(None, &mut size, false, 2, TCP_TABLE_CLASS(TCP_TABLE_OWNER_PID_ALL.0), 0);
+            let _ = GetExtendedTcpTable(
+                None,
+                &mut size,
+                false,
+                2,
+                TCP_TABLE_CLASS(TCP_TABLE_OWNER_PID_ALL.0),
+                0,
+            );
             if size > 0 {
                 let mut buffer = vec![0u8; size as usize];
-                if GetExtendedTcpTable(Some(buffer.as_mut_ptr() as *mut _), &mut size, false, 2, TCP_TABLE_CLASS(TCP_TABLE_OWNER_PID_ALL.0), 0) == 0 {
+                if GetExtendedTcpTable(
+                    Some(buffer.as_mut_ptr() as *mut _),
+                    &mut size,
+                    false,
+                    2,
+                    TCP_TABLE_CLASS(TCP_TABLE_OWNER_PID_ALL.0),
+                    0,
+                ) == 0
+                {
                     let header_size = std::mem::size_of::<u32>();
                     if buffer.len() >= header_size {
                         let table = &*(buffer.as_ptr() as *const MIB_TCPTABLE_OWNER_PID);
@@ -1235,11 +1384,15 @@ fn run_cache_refresher(
                         let entry_size = std::mem::size_of::<MIB_TCPROW_OWNER_PID>();
                         let max_entries = buffer.len().saturating_sub(header_size) / entry_size;
                         let safe_entries = num_entries.min(max_entries);
-                        let entries = std::slice::from_raw_parts(table.table.as_ptr(), safe_entries);
+                        let entries =
+                            std::slice::from_raw_parts(table.table.as_ptr(), safe_entries);
                         for entry in entries {
                             let local_ip = Ipv4Addr::from(entry.dwLocalAddr.to_ne_bytes());
                             let local_port = u16::from_be(entry.dwLocalPort as u16);
-                            connections.insert(ConnectionKey::new(local_ip, local_port, Protocol::Tcp), entry.dwOwningPid);
+                            connections.insert(
+                                ConnectionKey::new(local_ip, local_port, Protocol::Tcp),
+                                entry.dwOwningPid,
+                            );
                         }
                     }
                 }
@@ -1250,10 +1403,25 @@ fn run_cache_refresher(
         #[cfg(windows)]
         unsafe {
             let mut size: u32 = 0;
-            let _ = GetExtendedUdpTable(None, &mut size, false, 2, UDP_TABLE_CLASS(UDP_TABLE_OWNER_PID.0), 0);
+            let _ = GetExtendedUdpTable(
+                None,
+                &mut size,
+                false,
+                2,
+                UDP_TABLE_CLASS(UDP_TABLE_OWNER_PID.0),
+                0,
+            );
             if size > 0 {
                 let mut buffer = vec![0u8; size as usize];
-                if GetExtendedUdpTable(Some(buffer.as_mut_ptr() as *mut _), &mut size, false, 2, UDP_TABLE_CLASS(UDP_TABLE_OWNER_PID.0), 0) == 0 {
+                if GetExtendedUdpTable(
+                    Some(buffer.as_mut_ptr() as *mut _),
+                    &mut size,
+                    false,
+                    2,
+                    UDP_TABLE_CLASS(UDP_TABLE_OWNER_PID.0),
+                    0,
+                ) == 0
+                {
                     let header_size = std::mem::size_of::<u32>();
                     if buffer.len() >= header_size {
                         let table = &*(buffer.as_ptr() as *const MIB_UDPTABLE_OWNER_PID);
@@ -1261,11 +1429,15 @@ fn run_cache_refresher(
                         let entry_size = std::mem::size_of::<MIB_UDPROW_OWNER_PID>();
                         let max_entries = buffer.len().saturating_sub(header_size) / entry_size;
                         let safe_entries = num_entries.min(max_entries);
-                        let entries = std::slice::from_raw_parts(table.table.as_ptr(), safe_entries);
+                        let entries =
+                            std::slice::from_raw_parts(table.table.as_ptr(), safe_entries);
                         for entry in entries {
                             let local_ip = Ipv4Addr::from(entry.dwLocalAddr.to_ne_bytes());
                             let local_port = u16::from_be(entry.dwLocalPort as u16);
-                            connections.insert(ConnectionKey::new(local_ip, local_port, Protocol::Udp), entry.dwOwningPid);
+                            connections.insert(
+                                ConnectionKey::new(local_ip, local_port, Protocol::Udp),
+                                entry.dwOwningPid,
+                            );
                         }
                     }
                 }
@@ -1309,7 +1481,9 @@ fn run_cache_refresher(
             let snap = cache.get_snapshot();
             log::debug!(
                 "Cache refresh #{}: {} connections, {} PIDs",
-                refresh_count, snap.connections.len(), snap.pid_names.len()
+                refresh_count,
+                snap.connections.len(),
+                snap.pid_names.len()
             );
         }
     }
@@ -1321,7 +1495,10 @@ fn run_cache_refresher(
 #[cfg(windows)]
 fn get_process_name_by_pid(pid: u32) -> Option<String> {
     use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
 
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
@@ -1332,7 +1509,14 @@ fn get_process_name_by_pid(pid: u32) -> Option<String> {
         let mut buffer = [0u16; 260];
         let mut size = buffer.len() as u32;
 
-        if QueryFullProcessImageNameW(handle, PROCESS_NAME_FORMAT(0), windows::core::PWSTR(buffer.as_mut_ptr()), &mut size).is_ok() {
+        if QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            windows::core::PWSTR(buffer.as_mut_ptr()),
+            &mut size,
+        )
+        .is_ok()
+        {
             let _ = CloseHandle(handle);
             let path = String::from_utf16_lossy(&buffer[..size as usize]);
             let name = path.rsplit('\\').next().unwrap_or(&path);
@@ -1347,20 +1531,30 @@ fn get_process_name_by_pid(pid: u32) -> Option<String> {
 /// Parse ports from Ethernet frame (returns src_port, dst_port)
 #[inline(always)]
 fn parse_ports(data: &[u8]) -> Option<(u16, u16)> {
-    if data.len() < 14 + 20 + 4 { return None; }
+    if data.len() < 14 + 20 + 4 {
+        return None;
+    }
 
     let ethertype = u16::from_be_bytes([data[12], data[13]]);
-    if ethertype != 0x0800 { return None; }
+    if ethertype != 0x0800 {
+        return None;
+    }
 
     let version = (data[14] >> 4) & 0xF;
-    if version != 4 { return None; }
+    if version != 4 {
+        return None;
+    }
 
     let ihl = ((data[14] & 0xF) as usize) * 4;
     let protocol = data[14 + 9];
-    if protocol != 6 && protocol != 17 { return None; }
+    if protocol != 6 && protocol != 17 {
+        return None;
+    }
 
     let transport_start = 14 + ihl;
-    if data.len() < transport_start + 4 { return None; }
+    if data.len() < transport_start + 4 {
+        return None;
+    }
 
     let src_port = u16::from_be_bytes([data[transport_start], data[transport_start + 1]]);
     let dst_port = u16::from_be_bytes([data[transport_start + 2], data[transport_start + 3]]);
@@ -1374,14 +1568,20 @@ fn should_route_to_relay(
     snapshot: &ProcessSnapshot,
     inline_cache: &mut HashMap<(Ipv4Addr, u16, Protocol), bool>,
 ) -> bool {
-    if data.len() < 14 + 20 + 4 { return false; }
+    if data.len() < 14 + 20 + 4 {
+        return false;
+    }
 
     let ethertype = u16::from_be_bytes([data[12], data[13]]);
-    if ethertype != 0x0800 { return false; }
+    if ethertype != 0x0800 {
+        return false;
+    }
 
     let ip_start = 14;
     let version = (data[ip_start] >> 4) & 0xF;
-    if version != 4 { return false; }
+    if version != 4 {
+        return false;
+    }
 
     let ihl = ((data[ip_start] & 0xF) as usize) * 4;
     let protocol_num = data[ip_start + 9];
@@ -1391,11 +1591,23 @@ fn should_route_to_relay(
         _ => return false,
     };
 
-    let src_ip = Ipv4Addr::new(data[ip_start + 12], data[ip_start + 13], data[ip_start + 14], data[ip_start + 15]);
-    let dst_ip = Ipv4Addr::new(data[ip_start + 16], data[ip_start + 17], data[ip_start + 18], data[ip_start + 19]);
+    let src_ip = Ipv4Addr::new(
+        data[ip_start + 12],
+        data[ip_start + 13],
+        data[ip_start + 14],
+        data[ip_start + 15],
+    );
+    let dst_ip = Ipv4Addr::new(
+        data[ip_start + 16],
+        data[ip_start + 17],
+        data[ip_start + 18],
+        data[ip_start + 19],
+    );
 
     let transport_start = ip_start + ihl;
-    if data.len() < transport_start + 4 { return false; }
+    if data.len() < transport_start + 4 {
+        return false;
+    }
 
     let src_port = u16::from_be_bytes([data[transport_start], data[transport_start + 1]]);
     let dst_port = u16::from_be_bytes([data[transport_start + 2], data[transport_start + 3]]);
@@ -1429,13 +1641,8 @@ fn run_v3_inbound_receiver(
     throughput: ThroughputStats,
 ) {
     log::info!("V3 inbound receiver starting");
-    log::info!("  Relay: {}", relay.relay_addr);
+    log::info!("  Relay: {}", relay.relay.relay_addr());
     log::info!("  Adapter: {}", config.physical_adapter_name);
-
-    // Set socket to non-blocking for clean shutdown
-    if let Err(e) = relay.socket.set_read_timeout(Some(Duration::from_micros(100))) {
-        log::warn!("Failed to set socket read timeout: {}", e);
-    }
 
     let driver = match ndisapi::Ndisapi::new("NDISRD") {
         Ok(d) => d,
@@ -1453,10 +1660,16 @@ fn run_v3_inbound_receiver(
         }
     };
 
-    let adapter = match adapters.iter().find(|a| a.get_name() == &config.physical_adapter_name) {
+    let adapter = match adapters
+        .iter()
+        .find(|a| a.get_name() == &config.physical_adapter_name)
+    {
         Some(a) => a,
         None => {
-            log::error!("V3 inbound receiver: adapter '{}' not found", config.physical_adapter_name);
+            log::error!(
+                "V3 inbound receiver: adapter '{}' not found",
+                config.physical_adapter_name
+            );
             return;
         }
     };
@@ -1481,16 +1694,16 @@ fn run_v3_inbound_receiver(
             let uptime = now.duration_since(start_time).as_secs();
             log::info!(
                 "V3 inbound health: {}s uptime, {} recv, {} injected",
-                uptime, packets_received, packets_injected
+                uptime,
+                packets_received,
+                packets_injected
             );
         }
 
-        // Receive packet from relay (session_id already stripped by socket recv)
-        let n = match relay.socket.recv(&mut recv_buf) {
-            Ok(n) if n > 8 => n,
-            Ok(_) => continue,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut => continue,
+        // Receive payload from relay (session ID already verified/stripped).
+        let n = match relay.relay.receive_inbound(&mut recv_buf) {
+            Ok(Some(n)) => n,
+            Ok(None) => continue,
             Err(e) => {
                 log::warn!("V3 inbound: recv error: {}", e);
                 std::thread::sleep(Duration::from_millis(2));
@@ -1498,9 +1711,10 @@ fn run_v3_inbound_receiver(
             }
         };
 
-        // Strip 8-byte session ID prefix to get IP packet
-        let ip_packet = &recv_buf[8..n];
-        if ip_packet.len() < 20 { continue; }
+        let ip_packet = &recv_buf[..n];
+        if ip_packet.len() < 20 {
+            continue;
+        }
 
         packets_received += 1;
         throughput.add_rx(ip_packet.len() as u64);
@@ -1513,7 +1727,9 @@ fn run_v3_inbound_receiver(
 
     log::info!(
         "V3 inbound receiver stopped - {} recv, {} injected, {}s uptime",
-        packets_received, packets_injected, start_time.elapsed().as_secs()
+        packets_received,
+        packets_injected,
+        start_time.elapsed().as_secs()
     );
 }
 
@@ -1576,7 +1792,9 @@ fn calculate_ip_checksum(header: &[u8]) -> u16 {
 
 /// Calculate TCP checksum with pseudo-header (RFC 793)
 fn calculate_tcp_checksum(packet: &[u8], ihl: usize) -> u16 {
-    if packet.len() < ihl + 20 { return 0; }
+    if packet.len() < ihl + 20 {
+        return 0;
+    }
 
     let src_ip = &packet[12..16];
     let dst_ip = &packet[16..20];
@@ -1593,7 +1811,10 @@ fn calculate_tcp_checksum(packet: &[u8], ihl: usize) -> u16 {
 
     let mut i = 0;
     while i + 1 < tcp_segment.len() {
-        if i == 16 { i += 2; continue; }
+        if i == 16 {
+            i += 2;
+            continue;
+        }
         sum += u16::from_be_bytes([tcp_segment[i], tcp_segment[i + 1]]) as u32;
         i += 2;
     }
@@ -1608,7 +1829,9 @@ fn calculate_tcp_checksum(packet: &[u8], ihl: usize) -> u16 {
 
 /// Calculate UDP checksum with pseudo-header (RFC 768)
 fn calculate_udp_checksum(packet: &[u8], ihl: usize) -> u16 {
-    if packet.len() < ihl + 8 { return 0; }
+    if packet.len() < ihl + 8 {
+        return 0;
+    }
 
     let src_ip = &packet[12..16];
     let dst_ip = &packet[16..20];
@@ -1625,7 +1848,10 @@ fn calculate_udp_checksum(packet: &[u8], ihl: usize) -> u16 {
 
     let mut i = 0;
     while i + 1 < udp_datagram.len() {
-        if i == 6 { i += 2; continue; }
+        if i == 6 {
+            i += 2;
+            continue;
+        }
         sum += u16::from_be_bytes([udp_datagram[i], udp_datagram[i + 1]]) as u32;
         i += 2;
     }
@@ -1636,15 +1862,23 @@ fn calculate_udp_checksum(packet: &[u8], ihl: usize) -> u16 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     let checksum = !(sum as u16);
-    if checksum == 0 { 0xFFFF } else { checksum }
+    if checksum == 0 {
+        0xFFFF
+    } else {
+        checksum
+    }
 }
 
 /// Fix checksums in an IP packet (modifies packet in place)
 fn fix_packet_checksums(packet: &mut [u8]) -> bool {
-    if packet.len() < 20 { return false; }
+    if packet.len() < 20 {
+        return false;
+    }
 
     let ihl = ((packet[0] & 0x0F) as usize) * 4;
-    if packet.len() < ihl { return false; }
+    if packet.len() < ihl {
+        return false;
+    }
 
     // Fix IP header checksum
     packet[10] = 0;
@@ -1687,15 +1921,21 @@ fn get_adapter_friendly_name(internal_name: &str) -> Option<String> {
     use windows::Win32::NetworkManagement::IpHelper::{GetAdaptersInfo, IP_ADAPTER_INFO};
 
     let guid = internal_name
-        .rsplit('\\').next().unwrap_or("")
+        .rsplit('\\')
+        .next()
+        .unwrap_or("")
         .trim_matches(|c| c == '{' || c == '}');
 
-    if guid.is_empty() { return None; }
+    if guid.is_empty() {
+        return None;
+    }
 
     unsafe {
         let mut buf_len: u32 = 0;
         let _ = GetAdaptersInfo(None, &mut buf_len);
-        if buf_len == 0 { return None; }
+        if buf_len == 0 {
+            return None;
+        }
 
         let mut buffer: Vec<u8> = vec![0; buf_len as usize];
         let adapter_info_ptr = buffer.as_mut_ptr() as *mut IP_ADAPTER_INFO;
@@ -1707,13 +1947,21 @@ fn get_adapter_friendly_name(internal_name: &str) -> Option<String> {
         let mut current = adapter_info_ptr;
         while !current.is_null() {
             let adapter = &*current;
-            let adapter_name_bytes: Vec<u8> = adapter.AdapterName.iter()
-                .take_while(|&&b| b != 0).map(|&b| b as u8).collect();
+            let adapter_name_bytes: Vec<u8> = adapter
+                .AdapterName
+                .iter()
+                .take_while(|&&b| b != 0)
+                .map(|&b| b as u8)
+                .collect();
             let adapter_guid = String::from_utf8_lossy(&adapter_name_bytes);
 
             if adapter_guid.to_lowercase().contains(&guid.to_lowercase()) {
-                let desc_bytes: Vec<u8> = adapter.Description.iter()
-                    .take_while(|&&b| b != 0).map(|&b| b as u8).collect();
+                let desc_bytes: Vec<u8> = adapter
+                    .Description
+                    .iter()
+                    .take_while(|&&b| b != 0)
+                    .map(|&b| b as u8)
+                    .collect();
                 return Some(String::from_utf8_lossy(&desc_bytes).to_string());
             }
 
@@ -1737,21 +1985,40 @@ fn get_adapter_friendly_name_v2(internal_name: &str) -> Option<String> {
     use windows::Win32::Networking::WinSock::AF_UNSPEC;
 
     let guid = internal_name
-        .rsplit('\\').next().unwrap_or("")
+        .rsplit('\\')
+        .next()
+        .unwrap_or("")
         .trim_matches(|c| c == '{' || c == '}')
         .to_lowercase();
 
-    if guid.is_empty() { return None; }
+    if guid.is_empty() {
+        return None;
+    }
 
     unsafe {
         let mut buf_len: u32 = 0;
-        let _ = GetAdaptersAddresses(AF_UNSPEC.0 as u32, GAA_FLAG_INCLUDE_PREFIX, None, None, &mut buf_len);
-        if buf_len == 0 { return None; }
+        let _ = GetAdaptersAddresses(
+            AF_UNSPEC.0 as u32,
+            GAA_FLAG_INCLUDE_PREFIX,
+            None,
+            None,
+            &mut buf_len,
+        );
+        if buf_len == 0 {
+            return None;
+        }
 
         let mut buffer: Vec<u8> = vec![0; buf_len as usize];
         let adapter_addr_ptr = buffer.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
 
-        if GetAdaptersAddresses(AF_UNSPEC.0 as u32, GAA_FLAG_INCLUDE_PREFIX, None, Some(adapter_addr_ptr), &mut buf_len) != 0 {
+        if GetAdaptersAddresses(
+            AF_UNSPEC.0 as u32,
+            GAA_FLAG_INCLUDE_PREFIX,
+            None,
+            Some(adapter_addr_ptr),
+            &mut buf_len,
+        ) != 0
+        {
             return None;
         }
 
@@ -1761,11 +2028,16 @@ fn get_adapter_friendly_name_v2(internal_name: &str) -> Option<String> {
             if !adapter.AdapterName.0.is_null() {
                 let adapter_name = std::ffi::CStr::from_ptr(adapter.AdapterName.0 as *const i8);
                 if let Ok(name_str) = adapter_name.to_str() {
-                    let adapter_guid = name_str.trim_matches(|c| c == '{' || c == '}').to_lowercase();
+                    let adapter_guid = name_str
+                        .trim_matches(|c| c == '{' || c == '}')
+                        .to_lowercase();
                     if adapter_guid == guid {
                         if !adapter.FriendlyName.0.is_null() {
-                            let len = (0..).take_while(|&i| *adapter.FriendlyName.0.add(i) != 0).count();
-                            let friendly_slice = std::slice::from_raw_parts(adapter.FriendlyName.0, len);
+                            let len = (0..)
+                                .take_while(|&i| *adapter.FriendlyName.0.add(i) != 0)
+                                .count();
+                            let friendly_slice =
+                                std::slice::from_raw_parts(adapter.FriendlyName.0, len);
                             return Some(String::from_utf16_lossy(friendly_slice));
                         }
                     }

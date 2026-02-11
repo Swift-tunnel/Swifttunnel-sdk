@@ -1,10 +1,11 @@
 # SwiftTunnel SDK
 
-Native library for integrating SwiftTunnel VPN into third-party applications. Provides a C ABI (`cdylib`) with 28 functions covering authentication, server selection, V3 relay connection, and per-process split tunneling.
+Native library for integrating SwiftTunnel VPN into third-party applications. Provides a C ABI (`cdylib`) with 31 functions covering authentication, server selection, V3 relay connection, per-process split tunneling, and app-parity auto-routing.
 
 ## Features
 
 - **V3 Relay** - Unencrypted UDP relay for minimum latency gaming (`[session_id][payload]` to port 51821)
+- **Auto Routing (Opt-in)** - Dynamic relay switching by detected game-server region, with whitelist bypass + fail-open behavior
 - **Forced Split Tunneling** - Per-process routing via ndisapi + per-CPU packet workers
 - **Built-in Auth** - Email/password and Google OAuth with auto token refresh
 - **Credential Storage** - Windows Credential Manager (DPAPI)
@@ -30,8 +31,11 @@ int main() {
     swifttunnel_init();
     swifttunnel_auth_sign_in("user@example.com", "password");
 
-    const char* apps = "[\"RobloxPlayerBeta.exe\"]";
-    swifttunnel_connect("singapore", apps);
+    const char* options =
+        "{\"region\":\"singapore\","
+        "\"apps\":[\"RobloxPlayerBeta.exe\"],"
+        "\"auto_routing\":{\"enabled\":true,\"whitelisted_regions\":[\"US East\",\"Tokyo\"]}}";
+    swifttunnel_connect_ex(options);
 
     // Game traffic is now relayed through the VPN
     // Other traffic bypasses normally
@@ -48,7 +52,15 @@ using SwiftTunnelSDK;
 
 SwiftTunnel.Init();
 SwiftTunnel.AuthSignIn("user@example.com", "password");
-SwiftTunnel.Connect("singapore", new[] { "RobloxPlayerBeta.exe" });
+var options = new {
+    region = "singapore",
+    apps = new[] { "RobloxPlayerBeta.exe" },
+    auto_routing = new {
+        enabled = true,
+        whitelisted_regions = new[] { "US East", "Tokyo" }
+    }
+};
+SwiftTunnel.ConnectEx(JsonSerializer.Serialize(options));
 
 // ... game plays with VPN routing ...
 
@@ -63,7 +75,14 @@ from swifttunnel import SwiftTunnel
 
 with SwiftTunnel() as vpn:
     vpn.auth_sign_in("user@example.com", "password")
-    vpn.connect("singapore", ["RobloxPlayerBeta.exe"])
+    vpn.connect_ex({
+        "region": "singapore",
+        "apps": ["RobloxPlayerBeta.exe"],
+        "auto_routing": {
+            "enabled": True,
+            "whitelisted_regions": ["US East", "Tokyo"]
+        }
+    })
 
     # ... game plays with VPN routing ...
 
@@ -106,7 +125,8 @@ with SwiftTunnel() as vpn:
 
 | Function | Description |
 |----------|-------------|
-| `swifttunnel_connect(region, apps_json)` | Connect V3 relay with split tunnel |
+| `swifttunnel_connect(region, apps_json)` | Legacy connect (backward compatible, auto-routing disabled) |
+| `swifttunnel_connect_ex(options_json)` | Connect with JSON options including auto-routing |
 | `swifttunnel_disconnect()` | Disconnect |
 | `swifttunnel_get_state()` | Get state code (0=disconnected, 4=connected, -1=error) |
 | `swifttunnel_get_state_json()` | Get detailed state as JSON |
@@ -117,6 +137,7 @@ with SwiftTunnel() as vpn:
 |----------|-------------|
 | `swifttunnel_get_tunneled_processes()` | Get tunneled process names (JSON array) |
 | `swifttunnel_get_stats_json()` | Get packet stats (sent/received) |
+| `swifttunnel_get_auto_routing_json()` | Get auto-routing status and recent events |
 | `swifttunnel_refresh_processes()` | Trigger process cache refresh |
 
 ### Callbacks
@@ -126,6 +147,7 @@ with SwiftTunnel() as vpn:
 | `swifttunnel_on_state_change(cb, ctx)` | Register state change callback |
 | `swifttunnel_on_error(cb, ctx)` | Register error callback |
 | `swifttunnel_on_process_detected(cb, ctx)` | Register process detection callback |
+| `swifttunnel_on_auto_routing_event(cb, ctx)` | Register auto-routing event callback (JSON payload) |
 
 ### Error
 
@@ -150,13 +172,21 @@ with SwiftTunnel() as vpn:
 ## Architecture
 
 ```
-swifttunnel_connect("singapore", ["game.exe"])
+swifttunnel_connect_ex({
+  "region": "singapore",
+  "apps": ["game.exe"],
+  "auto_routing": {
+    "enabled": true,
+    "whitelisted_regions": ["US East", "Tokyo"]
+  }
+})
   |
   +-- 1. Auth check -> refresh token if needed
   +-- 2. POST /api/vpn/generate-config -> VpnConfig
   +-- 3. UdpRelay::new(server:51821) -> session_id
   +-- 4. SplitTunnelDriver (ndisapi + per-CPU workers + ETW)
-  +-- 5. Connected -> callback fired
+  +-- 5. Optional auto-router (geolocation + relay switch)
+  +-- 6. Connected -> callbacks fired
 ```
 
 ### Packet Flow
@@ -174,10 +204,10 @@ game.exe UDP packet
 
 ```
 src/
-  lib.rs                    # 28 FFI functions
+  lib.rs                    # 31 FFI functions
   runtime.rs                # Tokio runtime (lazy global)
   error.rs                  # Error types and codes
-  callbacks.rs              # State/error/process callbacks
+  callbacks.rs              # State/error/process/auto-routing callbacks
   auth/                     # Authentication (manager, client, storage, OAuth)
   vpn/                      # V3 relay, server list, config, connection state machine
   split_tunnel/             # ndisapi interceptor, process cache, tracker, ETW watcher

@@ -10,6 +10,7 @@
 //   dotnet run basic.cs
 
 using System;
+using System.Text.Json;
 using SwiftTunnel;
 
 class Program
@@ -33,6 +34,8 @@ class Program
 
         sdk.OnProcessDetected((name, added) =>
             Console.WriteLine($"[callback] process {(added ? "added" : "removed")}: {name}"));
+        sdk.OnAutoRoutingEvent(json =>
+            Console.WriteLine($"[callback] auto-routing: {json}"));
 
         // Authenticate
         try
@@ -61,15 +64,26 @@ class Program
             Console.Error.WriteLine($"Servers error ({ex.ErrorCode}): {ex.Message}");
         }
 
-        // Connect with split tunnelling
+        // Connect with split tunnelling + auto-routing
         try
         {
-            sdk.Connect(region, new[] { "RobloxPlayerBeta.exe" });
+            var options = new
+            {
+                region,
+                apps = new[] { "RobloxPlayerBeta.exe" },
+                auto_routing = new
+                {
+                    enabled = true,
+                    whitelisted_regions = new[] { "US East", "Tokyo" }
+                }
+            };
+            sdk.ConnectEx(JsonSerializer.Serialize(options));
 
             Console.WriteLine($"State: {sdk.State}");
             Console.WriteLine($"State detail: {sdk.StateJson}");
             Console.WriteLine($"Tunneled processes: {sdk.TunneledProcessesJson}");
             Console.WriteLine($"Stats: {sdk.StatsJson}");
+            Console.WriteLine($"Auto routing: {sdk.AutoRoutingJson}");
         }
         catch (SwiftTunnelException ex)
         {

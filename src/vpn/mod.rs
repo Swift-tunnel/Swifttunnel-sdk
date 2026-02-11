@@ -10,15 +10,19 @@
 //! - servers.rs: Server list, caching, and latency measurement
 //! - connection.rs: V3 connection state machine and lifecycle
 
-pub mod relay;
+pub mod auto_routing;
 pub mod config;
-pub mod servers;
 pub mod connection;
+pub mod geolocation;
+pub mod relay;
+pub mod servers;
 
-pub use relay::{UdpRelay, RelayContext};
+pub use auto_routing::{AutoRouter, AutoRoutingEvent};
 pub use config::{fetch_vpn_config, update_latency, VpnConfigRequest};
+pub use connection::{ConnectionState, VpnConnection};
+pub use geolocation::{lookup_game_server_region, RobloxRegion};
+pub use relay::{RelayContext, UdpRelay};
 pub use servers::{
-    ServerList, DynamicServerInfo, DynamicGamingRegion,
-    ServerListSource, load_server_list, measure_latency,
+    load_server_list, measure_latency, DynamicGamingRegion, DynamicServerInfo, ServerList,
+    ServerListSource,
 };
-pub use connection::{VpnConnection, ConnectionState};

@@ -1,30 +1,33 @@
 //! SwiftTunnel SDK — C FFI entry point
 //!
-//! Exposes 28 `extern "C"` functions for consumption by C#, Python, and other
+//! Exposes 31 `extern "C"` functions for consumption by C#, Python, and other
 //! languages via `cdylib`.  All async work is dispatched through the global
 //! Tokio runtime (`runtime().block_on()`).
 
-mod runtime;
-mod error;
-mod callbacks;
 mod auth;
-mod vpn;
+mod callbacks;
+mod error;
+mod runtime;
 mod split_tunnel;
+mod vpn;
 
 use std::ffi::{CStr, CString};
+use std::net::SocketAddr;
 use std::os::raw::{c_char, c_void};
 use std::ptr;
 
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use serde::Deserialize;
 
 use auth::AuthManager;
 use callbacks::{
-    register_error_callback, register_process_callback, register_state_callback,
+    register_auto_routing_callback, register_error_callback, register_process_callback,
+    register_state_callback,
 };
 use error::{
-    clear_error, last_error_code, set_error, set_sdk_error, take_last_error,
-    SdkError, SUCCESS, ERROR_NOT_INITIALIZED,
+    clear_error, last_error_code, set_error, set_sdk_error, take_last_error, SdkError,
+    ERROR_NOT_INITIALIZED, SUCCESS,
 };
 use runtime::runtime;
 use vpn::connection::{ConnectionState, VpnConnection};
@@ -39,6 +42,23 @@ struct SdkState {
 }
 
 static SDK: Lazy<Mutex<Option<SdkState>>> = Lazy::new(|| Mutex::new(None));
+
+#[derive(Debug, Deserialize)]
+struct ConnectExOptions {
+    region: String,
+    #[serde(default)]
+    apps: Vec<String>,
+    #[serde(default)]
+    auto_routing: AutoRoutingOptions,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AutoRoutingOptions {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    whitelisted_regions: Vec<String>,
+}
 
 /// Convenience: run `body` while holding the SDK lock.
 /// Returns `ERROR_NOT_INITIALIZED` (and sets the last-error) when the SDK has
@@ -75,6 +95,78 @@ unsafe fn from_c_str<'a>(p: *const c_char) -> Option<&'a str> {
     CStr::from_ptr(p).to_str().ok()
 }
 
+fn load_available_servers_for_auto_routing(
+    state: &mut SdkState,
+) -> Vec<(String, SocketAddr, Option<u32>)> {
+    if state.servers.is_empty() {
+        if let Ok((servers, regions, source)) = runtime().block_on(vpn::servers::load_server_list())
+        {
+            state.servers.update(servers, regions, source);
+        }
+    }
+
+    state
+        .servers
+        .servers()
+        .iter()
+        .filter_map(|s| {
+            let addr: SocketAddr = format!("{}:51821", s.ip).parse().ok()?;
+            let latency = state.servers.get_latency(&s.region);
+            Some((s.region.clone(), addr, latency))
+        })
+        .collect()
+}
+
+fn connect_with_options(state: &mut SdkState, options: ConnectExOptions) -> i32 {
+    let token = match runtime().block_on(state.auth.get_access_token()) {
+        Ok(t) => t,
+        Err(e) => {
+            set_sdk_error(&e);
+            return e.code();
+        }
+    };
+
+    let available_servers = if options.auto_routing.enabled {
+        load_available_servers_for_auto_routing(state)
+    } else {
+        Vec::new()
+    };
+
+    match runtime().block_on(state.vpn.connect_ex(
+        &token,
+        &options.region,
+        options.apps,
+        options.auto_routing.enabled,
+        available_servers,
+        options.auto_routing.whitelisted_regions,
+    )) {
+        Ok(()) => SUCCESS,
+        Err(e) => {
+            set_sdk_error(&e);
+            e.code()
+        }
+    }
+}
+
+fn parse_apps_json(raw: Option<&str>) -> Result<Vec<String>, SdkError> {
+    match raw {
+        Some(s) => serde_json::from_str(s)
+            .map_err(|e| SdkError::InvalidParam(format!("Invalid apps_json: {}", e))),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn default_auto_routing_json() -> serde_json::Value {
+    serde_json::json!({
+        "enabled": false,
+        "current_region": null,
+        "game_region": null,
+        "bypassed": false,
+        "pending_lookups": 0,
+        "events": [],
+    })
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Core (4)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -93,7 +185,10 @@ pub extern "C" fn swifttunnel_init() -> i32 {
     // Initialise logger (ignore errors if already set)
     let _ = env_logger::try_init();
 
-    log::info!("SwiftTunnel SDK v{} initialising", env!("CARGO_PKG_VERSION"));
+    log::info!(
+        "SwiftTunnel SDK v{} initialising",
+        env!("CARGO_PKG_VERSION")
+    );
 
     let auth = match AuthManager::new() {
         Ok(a) => a,
@@ -121,9 +216,7 @@ pub extern "C" fn swifttunnel_cleanup() {
     let mut guard = SDK.lock();
     if let Some(mut state) = guard.take() {
         // Best-effort disconnect
-        let connected = runtime().block_on(async {
-            state.vpn.state().await.is_connected()
-        });
+        let connected = runtime().block_on(async { state.vpn.state().await.is_connected() });
         if connected {
             let _ = runtime().block_on(state.vpn.disconnect());
         }
@@ -178,15 +271,15 @@ pub unsafe extern "C" fn swifttunnel_auth_sign_in(
     let email = email.to_string();
     let password = password.to_string();
 
-    with_sdk(|state| {
-        match runtime().block_on(state.auth.sign_in(&email, &password)) {
+    with_sdk(
+        |state| match runtime().block_on(state.auth.sign_in(&email, &password)) {
             Ok(()) => SUCCESS,
             Err(e) => {
                 set_sdk_error(&e);
                 e.code()
             }
-        }
-    })
+        },
+    )
 }
 
 /// Start Google OAuth flow.  Returns the URL to open in a browser.
@@ -269,15 +362,15 @@ pub extern "C" fn swifttunnel_auth_cancel_oauth() {
 pub extern "C" fn swifttunnel_auth_refresh() -> i32 {
     clear_error();
 
-    with_sdk(|state| {
-        match runtime().block_on(state.auth.refresh_if_needed()) {
+    with_sdk(
+        |state| match runtime().block_on(state.auth.refresh_if_needed()) {
             Ok(()) => SUCCESS,
             Err(e) => {
                 set_sdk_error(&e);
                 e.code()
             }
-        }
-    })
+        },
+    )
 }
 
 /// Sign out and clear stored credentials.
@@ -298,7 +391,13 @@ pub extern "C" fn swifttunnel_auth_sign_out() {
 pub extern "C" fn swifttunnel_auth_is_logged_in() -> i32 {
     let guard = SDK.lock();
     match guard.as_ref() {
-        Some(state) => if state.auth.is_logged_in() { 1 } else { 0 },
+        Some(state) => {
+            if state.auth.is_logged_in() {
+                1
+            } else {
+                0
+            }
+        }
         None => 0,
     }
 }
@@ -321,15 +420,13 @@ pub extern "C" fn swifttunnel_auth_get_user_json() -> *mut c_char {
     };
 
     match state.auth.get_user() {
-        Some(user) => {
-            match serde_json::to_string(&user) {
-                Ok(json) => to_c_string(&json),
-                Err(e) => {
-                    set_error(format!("JSON serialization failed: {}", e));
-                    ptr::null_mut()
-                }
+        Some(user) => match serde_json::to_string(&user) {
+            Ok(json) => to_c_string(&json),
+            Err(e) => {
+                set_error(format!("JSON serialization failed: {}", e));
+                ptr::null_mut()
             }
-        }
+        },
         None => ptr::null_mut(),
     }
 }
@@ -343,8 +440,8 @@ pub extern "C" fn swifttunnel_auth_get_user_json() -> *mut c_char {
 pub extern "C" fn swifttunnel_servers_fetch() -> i32 {
     clear_error();
 
-    with_sdk(|state| {
-        match runtime().block_on(vpn::servers::load_server_list()) {
+    with_sdk(
+        |state| match runtime().block_on(vpn::servers::load_server_list()) {
             Ok((servers, regions, source)) => {
                 state.servers.update(servers, regions, source);
                 SUCCESS
@@ -353,8 +450,8 @@ pub extern "C" fn swifttunnel_servers_fetch() -> i32 {
                 set_sdk_error(&e);
                 e.code()
             }
-        }
-    })
+        },
+    )
 }
 
 /// Get the cached server list as JSON.  Returns null if not fetched yet.
@@ -438,15 +535,10 @@ pub unsafe extern "C" fn swifttunnel_servers_ping(region: *const c_char) -> i32 
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Connection (4)
+//  Connection (5)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Connect to a VPN server.
-///
-/// `region` — region ID (e.g. `"singapore"`).
-/// `apps_json` — JSON array of exe names to tunnel (e.g. `["RobloxPlayerBeta.exe"]`).
-///
-/// Returns 0 on success, negative on error.
+/// Connect to a VPN server (legacy API, auto-routing disabled).
 #[no_mangle]
 pub unsafe extern "C" fn swifttunnel_connect(
     region: *const c_char,
@@ -463,18 +555,18 @@ pub unsafe extern "C" fn swifttunnel_connect(
         }
     };
 
-    let apps: Vec<String> = match from_c_str(apps_json) {
-        Some(s) => {
-            match serde_json::from_str(s) {
-                Ok(v) => v,
-                Err(e) => {
-                    let err = SdkError::InvalidParam(format!("Invalid apps_json: {}", e));
-                    set_sdk_error(&err);
-                    return err.code();
-                }
-            }
+    let apps: Vec<String> = match parse_apps_json(from_c_str(apps_json)) {
+        Ok(v) => v,
+        Err(err) => {
+            set_sdk_error(&err);
+            return err.code();
         }
-        None => Vec::new(),
+    };
+
+    let options = ConnectExOptions {
+        region,
+        apps,
+        auto_routing: AutoRoutingOptions::default(),
     };
 
     let mut guard = SDK.lock();
@@ -485,23 +577,51 @@ pub unsafe extern "C" fn swifttunnel_connect(
             return ERROR_NOT_INITIALIZED;
         }
     };
+    connect_with_options(state, options)
+}
 
-    // Get access token
-    let token = match runtime().block_on(state.auth.get_access_token()) {
-        Ok(t) => t,
-        Err(e) => {
+/// Connect using JSON options.
+///
+/// JSON contract:
+/// `{ \"region\": \"singapore\", \"apps\": [\"RobloxPlayerBeta.exe\"], \"auto_routing\": { \"enabled\": true, \"whitelisted_regions\": [\"US East\"] } }`
+#[no_mangle]
+pub unsafe extern "C" fn swifttunnel_connect_ex(options_json: *const c_char) -> i32 {
+    clear_error();
+
+    let raw = match from_c_str(options_json) {
+        Some(s) => s,
+        None => {
+            let e = SdkError::InvalidParam("options_json is null or invalid".into());
             set_sdk_error(&e);
             return e.code();
         }
     };
 
-    match runtime().block_on(state.vpn.connect(&token, &region, apps)) {
-        Ok(()) => SUCCESS,
+    let options: ConnectExOptions = match serde_json::from_str(raw) {
+        Ok(v) => v,
         Err(e) => {
-            set_sdk_error(&e);
-            e.code()
+            let err = SdkError::InvalidParam(format!("Invalid options_json: {}", e));
+            set_sdk_error(&err);
+            return err.code();
         }
+    };
+
+    if options.region.trim().is_empty() {
+        let err = SdkError::InvalidParam("region must not be empty".into());
+        set_sdk_error(&err);
+        return err.code();
     }
+
+    let mut guard = SDK.lock();
+    let state = match guard.as_mut() {
+        Some(s) => s,
+        None => {
+            set_sdk_error(&SdkError::NotInitialized);
+            return ERROR_NOT_INITIALIZED;
+        }
+    };
+
+    connect_with_options(state, options)
 }
 
 /// Disconnect from the VPN.  Returns 0 on success.
@@ -595,6 +715,10 @@ pub extern "C" fn swifttunnel_get_state_json() -> *mut c_char {
             "endpoint": server_endpoint,
             "split_tunnel_active": split_tunnel_active,
             "tunneled_processes": tunneled_processes,
+            "auto_routing": state
+                .vpn
+                .auto_routing_snapshot()
+                .unwrap_or_else(default_auto_routing_json),
             "error": null,
         }),
         ConnectionState::Error(msg) => serde_json::json!({
@@ -604,6 +728,10 @@ pub extern "C" fn swifttunnel_get_state_json() -> *mut c_char {
             "endpoint": null,
             "split_tunnel_active": false,
             "tunneled_processes": [],
+            "auto_routing": state
+                .vpn
+                .auto_routing_snapshot()
+                .unwrap_or_else(default_auto_routing_json),
             "error": msg,
         }),
         other => serde_json::json!({
@@ -613,6 +741,10 @@ pub extern "C" fn swifttunnel_get_state_json() -> *mut c_char {
             "endpoint": null,
             "split_tunnel_active": false,
             "tunneled_processes": [],
+            "auto_routing": state
+                .vpn
+                .auto_routing_snapshot()
+                .unwrap_or_else(default_auto_routing_json),
             "error": null,
         }),
     };
@@ -627,7 +759,7 @@ pub extern "C" fn swifttunnel_get_state_json() -> *mut c_char {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Split Tunnel (3)
+//  Split Tunnel (4)
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Get currently tunnelled process names as a JSON array.
@@ -648,15 +780,15 @@ pub extern "C" fn swifttunnel_get_tunneled_processes() -> *mut c_char {
 
     let conn_state = runtime().block_on(state.vpn.state());
     match &conn_state {
-        ConnectionState::Connected { tunneled_processes, .. } => {
-            match serde_json::to_string(tunneled_processes) {
-                Ok(json) => to_c_string(&json),
-                Err(e) => {
-                    set_error(format!("JSON serialization failed: {}", e));
-                    ptr::null_mut()
-                }
+        ConnectionState::Connected {
+            tunneled_processes, ..
+        } => match serde_json::to_string(tunneled_processes) {
+            Ok(json) => to_c_string(&json),
+            Err(e) => {
+                set_error(format!("JSON serialization failed: {}", e));
+                ptr::null_mut()
             }
-        }
+        },
         _ => to_c_string("[]"),
     }
 }
@@ -697,6 +829,35 @@ pub extern "C" fn swifttunnel_get_stats_json() -> *mut c_char {
     }
 }
 
+/// Get auto-routing state as JSON.
+/// Caller must free the returned string.
+#[no_mangle]
+pub extern "C" fn swifttunnel_get_auto_routing_json() -> *mut c_char {
+    clear_error();
+
+    let guard = SDK.lock();
+    let state = match guard.as_ref() {
+        Some(s) => s,
+        None => {
+            set_sdk_error(&SdkError::NotInitialized);
+            return ptr::null_mut();
+        }
+    };
+
+    let payload = state
+        .vpn
+        .auto_routing_snapshot()
+        .unwrap_or_else(default_auto_routing_json);
+
+    match serde_json::to_string(&payload) {
+        Ok(s) => to_c_string(&s),
+        Err(e) => {
+            set_error(format!("JSON serialization failed: {}", e));
+            ptr::null_mut()
+        }
+    }
+}
+
 /// Trigger an immediate re-scan of tunnelled processes.
 /// Returns 0 on success, negative on error.
 #[no_mangle]
@@ -725,7 +886,7 @@ pub extern "C" fn swifttunnel_refresh_processes() -> i32 {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Callbacks (3)
+//  Callbacks (4)
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Register a callback for VPN state changes.
@@ -761,6 +922,17 @@ pub extern "C" fn swifttunnel_on_process_detected(
     register_process_callback(cb, ctx);
 }
 
+/// Register a callback for auto-routing events.
+///
+/// Signature: `fn(event_json: *const c_char, user_context: *mut c_void)`
+#[no_mangle]
+pub extern "C" fn swifttunnel_on_auto_routing_event(
+    cb: Option<unsafe extern "C" fn(*const i8, *mut c_void)>,
+    ctx: *mut c_void,
+) {
+    register_auto_routing_callback(cb, ctx);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Error (3)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -785,4 +957,59 @@ pub extern "C" fn swifttunnel_get_last_error_code() -> i32 {
 #[no_mangle]
 pub extern "C" fn swifttunnel_clear_error() {
     clear_error();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connect_ex_defaults_when_optional_fields_are_omitted() {
+        let parsed: ConnectExOptions =
+            serde_json::from_str(r#"{"region":"singapore"}"#).expect("valid json");
+
+        assert_eq!(parsed.region, "singapore");
+        assert!(parsed.apps.is_empty());
+        assert!(!parsed.auto_routing.enabled);
+        assert!(parsed.auto_routing.whitelisted_regions.is_empty());
+    }
+
+    #[test]
+    fn connect_ex_parses_full_contract() {
+        let parsed: ConnectExOptions = serde_json::from_str(
+            r#"{
+                "region":"singapore",
+                "apps":["RobloxPlayerBeta.exe"],
+                "auto_routing":{"enabled":true,"whitelisted_regions":["US East","Tokyo"]}
+            }"#,
+        )
+        .expect("valid json");
+
+        assert_eq!(parsed.region, "singapore");
+        assert_eq!(parsed.apps, vec!["RobloxPlayerBeta.exe"]);
+        assert!(parsed.auto_routing.enabled);
+        assert_eq!(
+            parsed.auto_routing.whitelisted_regions,
+            vec!["US East", "Tokyo"]
+        );
+    }
+
+    #[test]
+    fn connect_ex_rejects_invalid_json() {
+        let parsed: Result<ConnectExOptions, _> = serde_json::from_str("{not-json}");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn legacy_connect_apps_json_defaults_and_parsing() {
+        let empty = parse_apps_json(None).expect("None should default");
+        assert!(empty.is_empty());
+
+        let parsed =
+            parse_apps_json(Some(r#"["RobloxPlayerBeta.exe","Game.exe"]"#)).expect("valid array");
+        assert_eq!(parsed, vec!["RobloxPlayerBeta.exe", "Game.exe"]);
+
+        let invalid = parse_apps_json(Some(r#"{"apps":["bad"]}"#));
+        assert!(invalid.is_err());
+    }
 }
