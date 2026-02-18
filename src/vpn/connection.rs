@@ -1,11 +1,12 @@
 //! VPN Connection Manager (V3 SDK)
 //!
 //! Manages V3 relay lifecycle:
-//! - Config fetch
-//! - UDP relay creation
+//! - Relay endpoint resolution
+//! - Relay auth ticket bootstrap
 //! - Split tunnel setup (ndisapi)
 //! - Optional auto-routing
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -14,21 +15,137 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use tokio::sync::Mutex;
 
+use crate::auth::client::AuthClient;
 use crate::auth::types::VpnConfig;
 use crate::callbacks::{fire_auto_routing_event, fire_error, fire_state_change};
 
 use super::auto_routing::{AutoRouter, AutoRoutingEvent};
-use super::config::fetch_vpn_config;
 use super::geolocation::lookup_game_server_region;
-use super::relay::UdpRelay;
+use super::relay::{RelayAuthAckStatus, UdpRelay};
+use super::servers::measure_latency_icmp;
 
 const REFRESH_INTERVAL_MS: u64 = 50;
+const AUTO_ROUTING_PING_SAMPLES: usize = 5;
 
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn normalize_region(region: &str) -> String {
+    let trimmed = region.trim().to_ascii_lowercase();
+    match trimmed.as_str() {
+        "america" | "us" | "usa" => "america".to_string(),
+        _ => trimmed,
+    }
+}
+
+fn pick_lowest_latency_server<'a>(
+    candidates: impl Iterator<Item = &'a (String, SocketAddr, Option<u32>)>,
+) -> Option<&'a (String, SocketAddr, Option<u32>)> {
+    candidates.min_by_key(|(_, _, latency_ms)| latency_ms.unwrap_or(u32::MAX))
+}
+
+pub(crate) fn relay_candidates_for_region(
+    selected_region: &str,
+    available_servers: &[(String, SocketAddr, Option<u32>)],
+    forced_server: Option<&str>,
+) -> Vec<(String, SocketAddr, Option<u32>)> {
+    if let Some(pinned) = forced_server {
+        if let Some((region, relay_addr, latency_ms)) = available_servers
+            .iter()
+            .find(|(region, _, _)| region == pinned)
+        {
+            return vec![(region.clone(), *relay_addr, *latency_ms)];
+        }
+    }
+
+    if selected_region == "america" {
+        let mut us_candidates = available_servers
+            .iter()
+            .filter(|(region, _, _)| region.starts_with("us-"))
+            .map(|(region, relay_addr, latency_ms)| (region.clone(), *relay_addr, *latency_ms))
+            .collect::<Vec<_>>();
+        if !us_candidates.is_empty() {
+            return us_candidates;
+        }
+    }
+
+    let exact = available_servers
+        .iter()
+        .filter(|(region, _, _)| region == selected_region)
+        .map(|(region, relay_addr, latency_ms)| (region.clone(), *relay_addr, *latency_ms))
+        .collect::<Vec<_>>();
+    if !exact.is_empty() {
+        return exact;
+    }
+
+    let prefix = format!("{selected_region}-");
+    available_servers
+        .iter()
+        .filter(|(region, _, _)| region.starts_with(&prefix))
+        .map(|(region, relay_addr, latency_ms)| (region.clone(), *relay_addr, *latency_ms))
+        .collect()
+}
+
+fn should_probe_candidates(candidates: &[(String, SocketAddr, Option<u32>)]) -> bool {
+    candidates.len() > 1
+        && candidates
+            .iter()
+            .any(|(_, _, latency_ms)| latency_ms.is_none())
+}
+
+fn average_probe_latency(samples: &[u32]) -> Option<u32> {
+    if samples.is_empty() {
+        return None;
+    }
+
+    let total: u64 = samples.iter().map(|v| *v as u64).sum();
+    Some((total / samples.len() as u64) as u32)
+}
+
+fn resolve_relay_server_from_candidates(
+    candidates: &[(String, SocketAddr, Option<u32>)],
+    probe_result: Option<(String, SocketAddr, u32)>,
+) -> Option<(String, SocketAddr)> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    if candidates.len() == 1 {
+        let (region, relay_addr, _) = &candidates[0];
+        return Some((region.clone(), *relay_addr));
+    }
+
+    if should_probe_candidates(candidates) {
+        if let Some((region, relay_addr, _)) = probe_result {
+            return Some((region, relay_addr));
+        }
+    }
+
+    pick_lowest_latency_server(candidates.iter())
+        .map(|(region, relay_addr, _)| (region.clone(), *relay_addr))
+}
+
+async fn resolve_relay_server_for_region_with_probing(
+    selected_region: &str,
+    available_servers: &[(String, SocketAddr, Option<u32>)],
+    forced_server: Option<&str>,
+) -> Option<(String, SocketAddr)> {
+    let candidates = relay_candidates_for_region(selected_region, available_servers, forced_server);
+    let probe_result = if should_probe_candidates(&candidates) {
+        let probe_targets = candidates
+            .iter()
+            .map(|(region, relay_addr, _)| (region.clone(), *relay_addr))
+            .collect::<Vec<_>>();
+        ping_and_select_best(&probe_targets).await
+    } else {
+        None
+    };
+
+    resolve_relay_server_from_candidates(&candidates, probe_result)
 }
 
 async fn ping_and_select_best(
@@ -39,10 +156,22 @@ async fn ping_and_select_best(
         let region = region.clone();
         let addr = *addr;
         tasks.push(tokio::spawn(async move {
-            let endpoint = addr.to_string();
-            super::servers::measure_latency(&endpoint)
-                .await
-                .map(|ms| (region, addr, ms))
+            let ip = addr.ip().to_string();
+            let result = tokio::task::spawn_blocking(move || {
+                let mut samples = Vec::with_capacity(AUTO_ROUTING_PING_SAMPLES);
+                for _ in 0..AUTO_ROUTING_PING_SAMPLES {
+                    if let Some(ms) = measure_latency_icmp(&ip) {
+                        samples.push(ms);
+                    }
+                }
+                average_probe_latency(&samples).map(|avg| (avg, samples.len()))
+            })
+            .await;
+
+            match result {
+                Ok(Some((avg_ms, _))) => Some((region, addr, avg_ms)),
+                _ => None,
+            }
         }));
     }
 
@@ -54,7 +183,43 @@ async fn ping_and_select_best(
             }
         }
     }
+
     best
+}
+
+async fn resolve_custom_relay_addr(custom: &str) -> Result<SocketAddr, crate::error::SdkError> {
+    let (host, port_str) = custom.rsplit_once(':').ok_or_else(|| {
+        crate::error::SdkError::InvalidParam(format!(
+            "custom_relay_server '{}' must be host:port",
+            custom
+        ))
+    })?;
+
+    let port: u16 = port_str.parse().map_err(|e| {
+        crate::error::SdkError::InvalidParam(format!(
+            "Invalid port in custom_relay_server '{}': {}",
+            custom, e
+        ))
+    })?;
+
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+
+    let mut addrs = tokio::net::lookup_host(format!("{}:{}", host, port))
+        .await
+        .map_err(|e| {
+            crate::error::SdkError::Network(format!(
+                "Failed to resolve custom_relay_server '{}': {}",
+                custom, e
+            ))
+        })?;
+    addrs.next().ok_or_else(|| {
+        crate::error::SdkError::Network(format!(
+            "DNS resolution returned no addresses for '{}'",
+            custom
+        ))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -67,6 +232,8 @@ pub enum ConnectionState {
         since: Instant,
         server_region: String,
         server_endpoint: String,
+        assigned_ip: String,
+        relay_auth_mode: String,
         split_tunnel_active: bool,
         tunneled_processes: Vec<String>,
     },
@@ -98,7 +265,7 @@ impl ConnectionState {
     pub fn status_text(&self) -> &'static str {
         match self {
             ConnectionState::Disconnected => "Disconnected",
-            ConnectionState::FetchingConfig => "Fetching configuration...",
+            ConnectionState::FetchingConfig => "Resolving relay endpoint...",
             ConnectionState::Connecting => "Connecting to server...",
             ConnectionState::ConfiguringSplitTunnel => "Configuring split tunnel...",
             ConnectionState::Connected { .. } => "Connected",
@@ -212,21 +379,26 @@ impl VpnConnection {
             access_token,
             region,
             tunnel_apps,
+            None,
             false,
             Vec::new(),
             Vec::new(),
+            HashMap::new(),
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn connect_ex(
         &mut self,
         access_token: &str,
         region: &str,
         tunnel_apps: Vec<String>,
+        custom_relay_server: Option<String>,
         auto_routing_enabled: bool,
         available_servers: Vec<(String, SocketAddr, Option<u32>)>,
         whitelisted_regions: Vec<String>,
+        forced_servers: HashMap<String, String>,
     ) -> Result<(), crate::error::SdkError> {
         {
             let state = self.state.lock().await;
@@ -241,31 +413,143 @@ impl VpnConnection {
         }
 
         self.set_state(ConnectionState::FetchingConfig).await;
-        let config = match fetch_vpn_config(access_token, region).await {
-            Ok(c) => c,
-            Err(e) => {
-                self.set_state(ConnectionState::Error(e.to_string())).await;
-                return Err(e);
+        let normalized_region = normalize_region(region);
+
+        let (resolved_server_region, default_relay_addr): (String, Option<SocketAddr>) =
+            if available_servers.is_empty() {
+                if custom_relay_server.is_some() {
+                    (normalized_region.clone(), None)
+                } else {
+                    let err = crate::error::SdkError::Config(
+                        "Selected region is unavailable in server list".to_string(),
+                    );
+                    self.set_state(ConnectionState::Error(err.to_string()))
+                        .await;
+                    return Err(err);
+                }
+            } else {
+                let forced_for_region = forced_servers.get(&normalized_region).map(|s| s.as_str());
+                let selected = resolve_relay_server_for_region_with_probing(
+                    &normalized_region,
+                    &available_servers,
+                    forced_for_region,
+                )
+                .await;
+
+                match selected {
+                    Some((server_region, relay_addr)) => (server_region, Some(relay_addr)),
+                    None => {
+                        let err = crate::error::SdkError::Config(format!(
+                            "Selected region '{}' is unavailable in server list",
+                            normalized_region
+                        ));
+                        self.set_state(ConnectionState::Error(err.to_string()))
+                            .await;
+                        return Err(err);
+                    }
+                }
+            };
+
+        self.set_state(ConnectionState::Connecting).await;
+        let relay_addr = if let Some(custom) = custom_relay_server.as_deref() {
+            match resolve_custom_relay_addr(custom).await {
+                Ok(addr) => addr,
+                Err(err) => {
+                    self.set_state(ConnectionState::Error(err.to_string()))
+                        .await;
+                    return Err(err);
+                }
+            }
+        } else {
+            match default_relay_addr {
+                Some(addr) => addr,
+                None => {
+                    let err = crate::error::SdkError::Config(
+                        "No relay endpoint available for selected region".to_string(),
+                    );
+                    self.set_state(ConnectionState::Error(err.to_string()))
+                        .await;
+                    return Err(err);
+                }
             }
         };
 
-        self.config = Some(config.clone());
-
-        self.set_state(ConnectionState::Connecting).await;
-        let vpn_ip = config
-            .endpoint
-            .split(':')
-            .next()
-            .unwrap_or(&config.endpoint);
-        let relay_addr: SocketAddr = format!("{}:51821", vpn_ip)
-            .parse()
-            .map_err(|e| crate::error::SdkError::Vpn(format!("Invalid relay address: {}", e)))?;
-
-        let relay = Arc::new(UdpRelay::new(relay_addr)?);
+        let relay = match UdpRelay::new(relay_addr) {
+            Ok(relay) => Arc::new(relay),
+            Err(err) => {
+                self.set_state(ConnectionState::Error(err.to_string()))
+                    .await;
+                return Err(err);
+            }
+        };
         self.relay = Some(Arc::clone(&relay));
+
+        let mut relay_auth_mode = if custom_relay_server.is_some() {
+            "custom_legacy".to_string()
+        } else {
+            "legacy_fallback".to_string()
+        };
+
+        if custom_relay_server.is_none() {
+            let auth_client = AuthClient::new();
+            let session_id_hex = relay.session_id_hex();
+            match auth_client
+                .get_relay_ticket(access_token, &resolved_server_region, &session_id_hex)
+                .await
+            {
+                Ok(ticket) => match relay.authenticate_with_ticket(&ticket.token) {
+                    Ok(Some(RelayAuthAckStatus::Ok)) => {
+                        relay_auth_mode = "authenticated".to_string();
+                    }
+                    Ok(Some(status)) => {
+                        if ticket.auth_required {
+                            let err = crate::error::SdkError::Vpn(format!(
+                                "Relay authentication required but failed ({})",
+                                status.as_str()
+                            ));
+                            self.set_state(ConnectionState::Error(err.to_string()))
+                                .await;
+                            return Err(err);
+                        }
+                    }
+                    Ok(None) => {
+                        if ticket.auth_required {
+                            let err = crate::error::SdkError::Vpn(
+                                "Relay authentication required but relay did not acknowledge auth hello"
+                                    .to_string(),
+                            );
+                            self.set_state(ConnectionState::Error(err.to_string()))
+                                .await;
+                            return Err(err);
+                        }
+                    }
+                    Err(e) => {
+                        if ticket.auth_required {
+                            self.set_state(ConnectionState::Error(e.to_string())).await;
+                            return Err(e);
+                        }
+                    }
+                },
+                Err(e) => {
+                    log::warn!(
+                        "Relay ticket unavailable for '{}' ({}), using legacy fallback mode",
+                        resolved_server_region,
+                        e
+                    );
+                }
+            }
+        }
 
         self.set_state(ConnectionState::ConfiguringSplitTunnel)
             .await;
+
+        let config = VpnConfig {
+            region: resolved_server_region.clone(),
+            endpoint: relay_addr.to_string(),
+            assigned_ip: "V3-Relay".to_string(),
+            ..Default::default()
+        };
+        self.config = Some(config.clone());
 
         let (tunneled_processes, split_tunnel_active) = if !tunnel_apps.is_empty() {
             match self
@@ -276,6 +560,7 @@ impl VpnConnection {
                     auto_routing_enabled,
                     available_servers,
                     whitelisted_regions,
+                    forced_servers,
                 )
                 .await
             {
@@ -296,8 +581,10 @@ impl VpnConnection {
 
         self.set_state(ConnectionState::Connected {
             since: Instant::now(),
-            server_region: config.region.clone(),
-            server_endpoint: config.endpoint.clone(),
+            server_region: resolved_server_region,
+            server_endpoint: relay_addr.to_string(),
+            assigned_ip: "V3-Relay".to_string(),
+            relay_auth_mode,
             split_tunnel_active,
             tunneled_processes,
         })
@@ -306,6 +593,7 @@ impl VpnConnection {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn setup_split_tunnel(
         &mut self,
         config: &VpnConfig,
@@ -314,6 +602,7 @@ impl VpnConnection {
         auto_routing_enabled: bool,
         available_servers: Vec<(String, SocketAddr, Option<u32>)>,
         whitelisted_regions: Vec<String>,
+        forced_servers: HashMap<String, String>,
     ) -> Result<Vec<String>, crate::error::SdkError> {
         if !crate::split_tunnel::SplitTunnelDriver::check_driver_available() {
             return Err(crate::error::SdkError::SplitTunnel(
@@ -336,56 +625,42 @@ impl VpnConnection {
         let auto_router = Arc::new(AutoRouter::new(auto_routing_enabled, &config.region));
         auto_router.set_current_relay(relay.relay_addr(), &config.region);
         auto_router.set_available_servers(available_servers.clone());
+        auto_router.set_forced_servers(forced_servers);
         if !whitelisted_regions.is_empty() {
             auto_router.set_whitelisted_regions(whitelisted_regions);
         }
 
         if auto_routing_enabled {
-            if available_servers.is_empty() {
-                let reason =
-                    "Auto-routing enabled but no available servers; continuing without switching"
-                        .to_string();
-                auto_router.push_degraded_event(reason.clone());
-                auto_router.set_enabled(false);
-                fire_auto_routing_event(
-                    &json!({
-                        "type": "degraded",
-                        "timestamp_ms": now_millis(),
-                        "from_region": config.region,
-                        "to_region": config.region,
-                        "game_server_region": "Unknown",
-                        "location": null,
-                        "relay_addr": relay.relay_addr().to_string(),
-                        "reason": reason,
-                    })
-                    .to_string(),
-                );
-            } else {
-                let (lookup_tx, mut lookup_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<std::net::Ipv4Addr>();
-                auto_router.set_lookup_channel(lookup_tx);
+            let (lookup_tx, mut lookup_rx) =
+                tokio::sync::mpsc::unbounded_channel::<std::net::Ipv4Addr>();
+            auto_router.set_lookup_channel(lookup_tx);
 
-                let router_for_lookup = Arc::clone(&auto_router);
-                let relay_for_lookup = Arc::clone(relay);
-                tokio::spawn(async move {
-                    while let Some(ip) = lookup_rx.recv().await {
-                        match lookup_game_server_region(ip).await {
-                            Some((region, location)) => {
-                                let old_region = router_for_lookup.current_region();
-                                let candidates =
-                                    router_for_lookup.get_candidates_for_region(&region);
+            let router_for_lookup = Arc::clone(&auto_router);
+            let relay_for_lookup = Arc::clone(relay);
+            tokio::spawn(async move {
+                while let Some(ip) = lookup_rx.recv().await {
+                    match lookup_game_server_region(ip).await {
+                        Some((region, location)) => {
+                            let old_region = router_for_lookup.current_region();
 
-                                if let Some(candidates) = candidates {
-                                    let best = ping_and_select_best(&candidates).await;
-                                    let selected = best
-                                        .map(|(r, a, _)| (r, a))
-                                        .unwrap_or_else(|| candidates[0].clone());
-
+                            if let Some(target_region) = region.best_swifttunnel_region() {
+                                let forced_server =
+                                    router_for_lookup.forced_server_for_region(target_region);
+                                let available_servers =
+                                    router_for_lookup.available_servers_snapshot();
+                                if let Some((selected_region, selected_addr)) =
+                                    resolve_relay_server_for_region_with_probing(
+                                        target_region,
+                                        &available_servers,
+                                        forced_server.as_deref(),
+                                    )
+                                    .await
+                                {
                                     if let Some((new_addr, new_region)) = router_for_lookup
                                         .commit_switch(
                                             region.clone(),
-                                            selected.0,
-                                            selected.1,
+                                            selected_region,
+                                            selected_addr,
                                             Some(location.clone()),
                                         )
                                     {
@@ -409,15 +684,16 @@ impl VpnConnection {
                                         );
                                     }
                                 }
-                                router_for_lookup.clear_pending_lookup(ip);
                             }
-                            None => {
-                                router_for_lookup.clear_pending_lookup(ip);
-                            }
+
+                            router_for_lookup.clear_pending_lookup(ip);
+                        }
+                        None => {
+                            router_for_lookup.clear_pending_lookup(ip);
                         }
                     }
-                });
-            }
+                }
+            });
         }
 
         driver.set_auto_router(Arc::clone(&auto_router));
@@ -498,7 +774,6 @@ impl VpnConnection {
             guard.close();
         }
         self.split_tunnel = None;
-
         self.config = None;
     }
 
@@ -543,5 +818,122 @@ impl Drop for VpnConnection {
                 guard.close();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_servers() -> Vec<(String, SocketAddr, Option<u32>)> {
+        vec![
+            (
+                "us-east-nj".to_string(),
+                "108.61.7.6:51821".parse().unwrap(),
+                Some(35),
+            ),
+            (
+                "us-central-tx".to_string(),
+                "45.77.55.34:51821".parse().unwrap(),
+                Some(45),
+            ),
+            (
+                "us-west-sj".to_string(),
+                "149.28.232.77:51821".parse().unwrap(),
+                Some(75),
+            ),
+            (
+                "tokyo-02".to_string(),
+                "45.32.253.124:51821".parse().unwrap(),
+                Some(95),
+            ),
+        ]
+    }
+
+    #[test]
+    fn relay_candidates_exact_and_prefix_match() {
+        let servers = sample_servers();
+        let tokyo_candidates = relay_candidates_for_region("tokyo", &servers, None);
+        assert_eq!(tokyo_candidates.len(), 1);
+        assert_eq!(tokyo_candidates[0].0, "tokyo-02");
+
+        let east_candidates = relay_candidates_for_region("us-east", &servers, None);
+        assert_eq!(east_candidates.len(), 1);
+        assert_eq!(east_candidates[0].0, "us-east-nj");
+    }
+
+    #[test]
+    fn relay_candidates_support_legacy_america_alias() {
+        let servers = sample_servers();
+        let us_candidates = relay_candidates_for_region("america", &servers, None);
+
+        assert_eq!(us_candidates.len(), 3);
+        assert!(us_candidates
+            .iter()
+            .all(|(region, _, _)| region.starts_with("us-")));
+    }
+
+    #[test]
+    fn relay_candidates_honor_forced_server() {
+        let servers = sample_servers();
+        let forced = relay_candidates_for_region("us-east", &servers, Some("us-west-sj"));
+
+        assert_eq!(forced.len(), 1);
+        assert_eq!(forced[0].0, "us-west-sj");
+    }
+
+    #[test]
+    fn resolve_candidates_prefers_probe_result_when_needed() {
+        let candidates = vec![
+            (
+                "us-east-nj".to_string(),
+                "108.61.7.6:51821".parse().unwrap(),
+                None,
+            ),
+            (
+                "us-central-tx".to_string(),
+                "45.77.55.34:51821".parse().unwrap(),
+                None,
+            ),
+        ];
+        let probe = Some((
+            "us-central-tx".to_string(),
+            "45.77.55.34:51821".parse().unwrap(),
+            31,
+        ));
+
+        let selected = resolve_relay_server_from_candidates(&candidates, probe).unwrap();
+        assert_eq!(selected.0, "us-central-tx");
+    }
+
+    #[test]
+    fn resolve_candidates_fallbacks_to_lowest_cached_latency() {
+        let candidates = vec![
+            (
+                "us-east-nj".to_string(),
+                "108.61.7.6:51821".parse().unwrap(),
+                Some(40),
+            ),
+            (
+                "us-central-tx".to_string(),
+                "45.77.55.34:51821".parse().unwrap(),
+                Some(55),
+            ),
+        ];
+
+        let selected = resolve_relay_server_from_candidates(&candidates, None).unwrap();
+        assert_eq!(selected.0, "us-east-nj");
+    }
+
+    #[test]
+    fn custom_relay_requires_host_and_port() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(resolve_custom_relay_addr("relay.example.com"))
+            .unwrap_err();
+        assert!(matches!(err, crate::error::SdkError::InvalidParam(_)));
     }
 }

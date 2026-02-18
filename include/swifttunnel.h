@@ -99,7 +99,7 @@ int32_t swifttunnel_auth_is_logged_in(void);
  * Get user info as JSON.  Returns null if not logged in.
  * Caller must free the returned string.
  *
- * JSON shape: `{"id":"...","email":"..."}`
+ * JSON shape: `{"id":"...","email":"...","is_tester":false}`
  */
 char *swifttunnel_auth_get_user_json(void);
 
@@ -130,7 +130,10 @@ int32_t swifttunnel_connect(const char *region, const char *apps_json);
  * Connect using JSON options.
  *
  * JSON contract:
- * `{ \"region\": \"singapore\", \"apps\": [\"RobloxPlayerBeta.exe\"], \"auto_routing\": { \"enabled\": true, \"whitelisted_regions\": [\"US East\"] } }`
+ * `{ \"region\": \"singapore\", \"apps\": [\"RobloxPlayerBeta.exe\"], \"custom_relay_server\": \"relay.example.com:51821\", \"auto_routing\": { \"enabled\": true, \"whitelisted_regions\": [\"US East\"] }, \"forced_servers\": {\"us-east\": \"us-east-nj\"} }`
+ *
+ * `custom_relay_server` and `forced_servers` are optional additive fields.
+ * Legacy payloads with only `region`/`apps` remain valid.
  */
 int32_t swifttunnel_connect_ex(const char *options_json);
 
@@ -166,6 +169,8 @@ int32_t swifttunnel_get_state(void);
  *   "code": 4,
  *   "region": "singapore",
  *   "endpoint": "1.2.3.4:51821",
+ *   "assigned_ip": "V3-Relay",
+ *   "relay_auth_mode": "authenticated",
  *   "split_tunnel_active": true,
  *   "tunneled_processes": ["RobloxPlayerBeta.exe"],
  *   "error": null

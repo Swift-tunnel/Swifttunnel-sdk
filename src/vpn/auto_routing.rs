@@ -2,7 +2,7 @@
 
 use super::geolocation::RobloxRegion;
 use parking_lot::RwLock;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -47,8 +47,10 @@ pub struct AutoRouter {
     event_log: RwLock<VecDeque<AutoRoutingEvent>>,
     lookup_sender: RwLock<Option<tokio::sync::mpsc::UnboundedSender<Ipv4Addr>>>,
     pending_lookups: RwLock<HashSet<Ipv4Addr>>,
+    pending_any: AtomicBool,
     whitelisted_regions: RwLock<HashSet<String>>,
     auto_routing_bypassed: AtomicBool,
+    forced_servers: RwLock<HashMap<String, String>>,
 }
 
 impl AutoRouter {
@@ -65,8 +67,10 @@ impl AutoRouter {
             event_log: RwLock::new(VecDeque::new()),
             lookup_sender: RwLock::new(None),
             pending_lookups: RwLock::new(HashSet::new()),
+            pending_any: AtomicBool::new(false),
             whitelisted_regions: RwLock::new(HashSet::new()),
             auto_routing_bypassed: AtomicBool::new(false),
+            forced_servers: RwLock::new(HashMap::new()),
         }
     }
 
@@ -86,8 +90,21 @@ impl AutoRouter {
         *self.whitelisted_regions.write() = regions.into_iter().collect();
     }
 
+    /// Set forced servers (region_id -> server_id).
+    pub fn set_forced_servers(&self, servers: HashMap<String, String>) {
+        *self.forced_servers.write() = servers;
+    }
+
     pub fn set_available_servers(&self, servers: Vec<(String, SocketAddr, Option<u32>)>) {
         *self.available_servers.write() = servers;
+    }
+
+    pub fn available_servers_snapshot(&self) -> Vec<(String, SocketAddr, Option<u32>)> {
+        self.available_servers.read().clone()
+    }
+
+    pub fn forced_server_for_region(&self, region_id: &str) -> Option<String> {
+        self.forced_servers.read().get(region_id).cloned()
     }
 
     pub fn set_current_relay(&self, addr: SocketAddr, region: &str) {
@@ -150,6 +167,7 @@ impl AutoRouter {
 
         if let Some(mut pending) = self.pending_lookups.try_write() {
             pending.insert(game_server_ip);
+            self.pending_any.store(true, Ordering::Release);
         }
         if let Some(sender) = self.lookup_sender.read().as_ref() {
             let _ = sender.send(game_server_ip);
@@ -159,11 +177,17 @@ impl AutoRouter {
     }
 
     pub fn is_lookup_pending(&self, ip: Ipv4Addr) -> bool {
+        if !self.pending_any.load(Ordering::Acquire) {
+            return false;
+        }
         self.pending_lookups.read().contains(&ip)
     }
 
     pub fn clear_pending_lookup(&self, ip: Ipv4Addr) {
-        self.pending_lookups.write().remove(&ip);
+        let mut pending = self.pending_lookups.write();
+        pending.remove(&ip);
+        self.pending_any
+            .store(!pending.is_empty(), Ordering::Release);
     }
 
     pub fn get_candidates_for_region(
@@ -196,6 +220,7 @@ impl AutoRouter {
         self.auto_routing_bypassed.store(false, Ordering::Release);
 
         let best_st_region = game_region.best_swifttunnel_region()?;
+        let forced_server = self.forced_server_for_region(best_st_region);
         let current_st_region = self.current_st_region.read().clone();
         if current_st_region == best_st_region
             || current_st_region.starts_with(&format!("{}-", best_st_region))
@@ -205,12 +230,25 @@ impl AutoRouter {
         }
 
         let servers = self.available_servers.read();
-        let mut candidates_with_latency: Vec<&(String, SocketAddr, Option<u32>)> = servers
-            .iter()
-            .filter(|(region, _, _)| {
-                region == best_st_region || region.starts_with(&format!("{}-", best_st_region))
-            })
-            .collect();
+        let mut candidates_with_latency: Vec<&(String, SocketAddr, Option<u32>)> = if best_st_region
+            == "america"
+        {
+            servers
+                .iter()
+                .filter(|(region, _, _)| region.starts_with("us-"))
+                .collect()
+        } else {
+            let prefix = format!("{}-", best_st_region);
+            servers
+                .iter()
+                .filter(|(region, _, _)| region == best_st_region || region.starts_with(&prefix))
+                .collect()
+        };
+
+        if let Some(pinned) = forced_server {
+            candidates_with_latency.retain(|(region, _, _)| region == &pinned);
+        }
+
         candidates_with_latency.sort_by_key(|(_, _, latency)| latency.unwrap_or(u32::MAX));
         let candidates = candidates_with_latency
             .into_iter()
@@ -313,6 +351,7 @@ impl AutoRouter {
         *self.current_relay_addr.write() = None;
         self.seen_game_servers.write().clear();
         self.pending_lookups.write().clear();
+        self.pending_any.store(false, Ordering::Release);
         self.auto_routing_bypassed.store(false, Ordering::Release);
     }
 }
@@ -329,8 +368,8 @@ mod tests {
                 None,
             ),
             (
-                "america-01".to_string(),
-                "54.225.245.114:51821".parse().unwrap(),
+                "us-east-nj".to_string(),
+                "108.61.7.6:51821".parse().unwrap(),
                 None,
             ),
             (
@@ -370,6 +409,27 @@ mod tests {
     }
 
     #[test]
+    fn test_pending_any_fast_path_flag_tracks_pending_set() {
+        let router = AutoRouter::new(true, "singapore");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        router.set_lookup_channel(tx);
+
+        let ip = Ipv4Addr::new(128, 116, 102, 7);
+        assert!(!router
+            .pending_any
+            .load(std::sync::atomic::Ordering::Acquire));
+        router.evaluate_game_server(ip);
+        assert!(router
+            .pending_any
+            .load(std::sync::atomic::Ordering::Acquire));
+
+        router.clear_pending_lookup(ip);
+        assert!(!router
+            .pending_any
+            .load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
     fn test_get_candidates_and_commit_switch() {
         let router = AutoRouter::new(true, "singapore");
         router.set_available_servers(make_servers());
@@ -378,7 +438,7 @@ mod tests {
         let candidates = router.get_candidates_for_region(&RobloxRegion::UsEast);
         assert!(candidates.is_some());
         let candidates = candidates.unwrap();
-        assert_eq!(candidates[0].0, "america-01");
+        assert_eq!(candidates[0].0, "us-east-nj");
         let result = router.commit_switch(
             RobloxRegion::UsEast,
             candidates[0].0.clone(),
@@ -390,9 +450,9 @@ mod tests {
 
     #[test]
     fn test_same_region_no_switch() {
-        let router = AutoRouter::new(true, "america-01");
+        let router = AutoRouter::new(true, "us-east-nj");
         router.set_available_servers(make_servers());
-        router.set_current_relay("54.225.245.114:51821".parse().unwrap(), "america-01");
+        router.set_current_relay("108.61.7.6:51821".parse().unwrap(), "us-east-nj");
 
         let candidates = router.get_candidates_for_region(&RobloxRegion::UsEast);
         assert!(candidates.is_none());
@@ -407,8 +467,8 @@ mod tests {
         let sequence = vec![
             (
                 RobloxRegion::UsEast,
-                "america-01".to_string(),
-                "54.225.245.114:51821",
+                "us-east-nj".to_string(),
+                "108.61.7.6:51821",
             ),
             (
                 RobloxRegion::Tokyo,
@@ -422,8 +482,8 @@ mod tests {
             ),
             (
                 RobloxRegion::UsEast,
-                "america-01".to_string(),
-                "54.225.245.114:51821",
+                "us-east-nj".to_string(),
+                "108.61.7.6:51821",
             ),
         ];
 
@@ -455,5 +515,21 @@ mod tests {
         let candidates2 = router.get_candidates_for_region(&RobloxRegion::Tokyo);
         assert!(!router.is_bypassed());
         assert!(candidates2.is_some());
+    }
+
+    #[test]
+    fn test_forced_server_overrides_candidate_list() {
+        let router = AutoRouter::new(true, "singapore");
+        router.set_available_servers(make_servers());
+        router.set_forced_servers(HashMap::from([(
+            "us-east".to_string(),
+            "us-east-nj".to_string(),
+        )]));
+
+        let candidates = router
+            .get_candidates_for_region(&RobloxRegion::UsEast)
+            .expect("candidates");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, "us-east-nj");
     }
 }

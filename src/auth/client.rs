@@ -1,25 +1,40 @@
 //! HTTP client for SwiftTunnel API
 
-use super::types::{ExchangeTokenResponse, SupabaseAuthResponse, VpnConfig};
+use super::types::{ExchangeTokenResponse, RelayTicketResponse, SupabaseAuthResponse, VpnConfig};
 use crate::error::SdkError;
 use log::{debug, error, info};
 use reqwest::Client;
+use serde::Deserialize;
 use serde_json::json;
 
 const API_BASE_URL: &str = "https://swifttunnel.net";
 const SUPABASE_URL: &str = "https://auth.swifttunnel.net";
 const SUPABASE_ANON_KEY: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpvbnVnanZvcWtsdmdibmh4c2hnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjUyNTU3ODksImV4cCI6MjA4MDgzMTc4OX0.Jmme0whahuX2KEmklBZQzCcJnsHJemyO8U9TdynbyNE";
 
-/// HTTP client for authentication API calls
+/// Response from the user profile API.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserProfileResponse {
+    pub id: String,
+    #[serde(default)]
+    pub full_name: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub is_admin: bool,
+    #[serde(default)]
+    pub is_tester: bool,
+}
+
+/// HTTP client for authentication API calls.
 pub struct AuthClient {
     client: Client,
 }
 
 impl AuthClient {
-    /// Create a new AuthClient
+    /// Create a new AuthClient.
     pub fn new() -> Self {
         let client = Client::builder()
-            .user_agent("SwiftTunnel-SDK/1.0.0")
+            .user_agent("SwiftTunnel-SDK/1.1.0")
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("Failed to create HTTP client");
@@ -27,7 +42,7 @@ impl AuthClient {
         Self { client }
     }
 
-    /// Sign in with email and password via Supabase
+    /// Sign in with email and password via Supabase.
     pub async fn sign_in_with_password(
         &self,
         email: &str,
@@ -73,7 +88,7 @@ impl AuthClient {
         Ok(data)
     }
 
-    /// Refresh the access token via Supabase
+    /// Refresh the access token via Supabase.
     pub async fn refresh_token(
         &self,
         refresh_token: &str,
@@ -98,6 +113,13 @@ impl AuthClient {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             error!("Refresh token failed: {} - {}", status, body);
+
+            if is_refresh_token_permanently_invalid(&body) {
+                return Err(SdkError::Auth(
+                    "Session expired, please sign in again".to_string(),
+                ));
+            }
+
             return Err(SdkError::Auth(format!(
                 "Refresh failed: {} - {}",
                 status, body
@@ -113,7 +135,7 @@ impl AuthClient {
         Ok(data)
     }
 
-    /// Fetch VPN configuration for a region
+    /// Fetch VPN configuration for a region.
     pub async fn get_vpn_config(
         &self,
         access_token: &str,
@@ -153,8 +175,59 @@ impl AuthClient {
         Ok(data)
     }
 
-    /// Exchange OAuth token for magic link token (desktop OAuth flow)
-    /// Called after receiving the callback from browser OAuth
+    /// Fetch a short-lived relay auth ticket for a specific session/server pair.
+    pub async fn get_relay_ticket(
+        &self,
+        access_token: &str,
+        server_region: &str,
+        session_id: &str,
+    ) -> Result<RelayTicketResponse, SdkError> {
+        let url = format!("{}/api/vpn/relay-ticket", API_BASE_URL);
+
+        debug!(
+            "Fetching relay ticket for region {} and session {}",
+            server_region, session_id
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("Content-Type", "application/json")
+            .json(&json!({
+                "server_region": server_region,
+                "session_id": session_id,
+            }))
+            .send()
+            .await
+            .map_err(|e| SdkError::Network(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            error!("Relay ticket fetch failed: {} - {}", status, body);
+            return Err(SdkError::Auth(format!(
+                "Relay ticket fetch failed: {} - {}",
+                status, body
+            )));
+        }
+
+        let data: RelayTicketResponse = response
+            .json()
+            .await
+            .map_err(|e| SdkError::Auth(format!("Failed to parse relay ticket: {}", e)))?;
+
+        info!(
+            "Received relay ticket (auth_required: {}, key_id: {}, preflight_mode: {:?}, queue_full_mode: {:?})",
+            data.auth_required,
+            data.key_id,
+            data.preflight_mode(),
+            data.queue_full_mode()
+        );
+        Ok(data)
+    }
+
+    /// Exchange OAuth token for magic link token (desktop OAuth flow).
     pub async fn exchange_oauth_token(
         &self,
         exchange_token: &str,
@@ -212,7 +285,43 @@ impl AuthClient {
         Ok(data)
     }
 
-    /// Verify magic link token with Supabase to get access/refresh tokens
+    /// Fetch user profile from SwiftTunnel API (includes tester status).
+    pub async fn fetch_user_profile(
+        &self,
+        access_token: &str,
+    ) -> Result<UserProfileResponse, SdkError> {
+        let url = format!("{}/api/user/profile", API_BASE_URL);
+
+        debug!("Fetching user profile");
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .send()
+            .await
+            .map_err(|e| SdkError::Network(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            error!("Fetch user profile failed: {} - {}", status, body);
+            return Err(SdkError::Auth(format!(
+                "Profile fetch failed: {} - {}",
+                status, body
+            )));
+        }
+
+        let data: UserProfileResponse = response
+            .json()
+            .await
+            .map_err(|e| SdkError::Auth(format!("Failed to parse profile: {}", e)))?;
+
+        info!("Fetched user profile (is_tester: {})", data.is_tester);
+        Ok(data)
+    }
+
+    /// Verify magic link token with Supabase to get access/refresh tokens.
     pub async fn verify_magic_link(
         &self,
         email: &str,
@@ -286,4 +395,14 @@ impl Default for AuthClient {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Classify a Supabase refresh-token error response body.
+///
+/// Returns `true` if the error indicates a permanently invalid refresh token
+/// (revoked, rotated, or not found). These errors should not be retried.
+pub(crate) fn is_refresh_token_permanently_invalid(body: &str) -> bool {
+    body.contains("refresh_token_not_found")
+        || body.contains("Invalid Refresh Token")
+        || body.contains("refresh_token_already_used")
 }

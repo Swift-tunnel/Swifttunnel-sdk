@@ -4,14 +4,14 @@
 //! track which processes own which network connections. This allows us to
 //! determine which packets belong to which applications for split tunneling.
 
+use crate::error::SdkError;
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
-use crate::error::SdkError;
 
 #[cfg(windows)]
-use windows::Win32::NetworkManagement::IpHelper::*;
-#[cfg(windows)]
 use windows::Win32::Foundation::*;
+#[cfg(windows)]
+use windows::Win32::NetworkManagement::IpHelper::*;
 
 /// Protocol type for connection tracking
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

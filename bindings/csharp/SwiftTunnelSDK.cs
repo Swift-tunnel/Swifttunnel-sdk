@@ -4,7 +4,7 @@
 //   using SwiftTunnel;
 //   using var sdk = new SwiftTunnelClient();
 //   sdk.AuthSignIn("user@example.com", "password");
-//   sdk.Connect("singapore", new[] { "RobloxPlayerBeta.exe" });
+//   sdk.ConnectEx("{\"region\":\"singapore\",\"apps\":[\"RobloxPlayerBeta.exe\"],\"forced_servers\":{\"us-east\":\"us-east-nj\"}}");
 
 using System;
 using System.Runtime.InteropServices;
@@ -271,6 +271,7 @@ namespace SwiftTunnel
 
         public string? AuthGetUserJson()
         {
+            // Includes additive `is_tester` in v1.1.x.
             return ConsumeString(SwiftTunnelNative.swifttunnel_auth_get_user_json());
         }
 
@@ -304,6 +305,7 @@ namespace SwiftTunnel
 
         public void ConnectEx(string optionsJson)
         {
+            // Additive v1.1.x options: custom_relay_server + forced_servers.
             Check(SwiftTunnelNative.swifttunnel_connect_ex(optionsJson));
         }
 
@@ -321,6 +323,7 @@ namespace SwiftTunnel
 
         public string? StateJson
         {
+            // Includes additive fields like assigned_ip + relay_auth_mode in v1.1.x.
             get => ConsumeString(SwiftTunnelNative.swifttunnel_get_state_json());
         }
 

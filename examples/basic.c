@@ -139,12 +139,17 @@ int main(int argc, char** argv) {
         printf("ping %s: %d ms\n", region, latency);
     }
 
-    /* 5. Connect using connect_ex with auto-routing enabled */
+    /* 5. Connect using connect_ex with auto-routing enabled.
+     * Optional additive fields:
+     * - forced_servers: region_id -> server_id pinning
+     * - custom_relay_server: "host:port"
+     */
     char connect_opts[512];
     snprintf(
         connect_opts,
         sizeof(connect_opts),
         "{\"region\":\"%s\",\"apps\":[\"RobloxPlayerBeta.exe\"],"
+        "\"forced_servers\":{\"us-east\":\"us-east-nj\"},"
         "\"auto_routing\":{\"enabled\":true,\"whitelisted_regions\":[\"US East\",\"Tokyo\"]}}",
         region
     );
