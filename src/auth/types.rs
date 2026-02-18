@@ -59,6 +59,9 @@ impl AuthSession {
 pub struct UserInfo {
     pub id: String,
     pub email: String,
+    /// Whether this user has tester access (gates experimental features).
+    #[serde(default)]
+    pub is_tester: bool,
 }
 
 /// Supabase auth response
@@ -124,4 +127,66 @@ pub struct ExchangeTokenResponse {
     pub email: String,
     /// User's ID
     pub user_id: String,
+}
+
+/// Response from relay ticket bootstrap endpoint.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayPreflightMode {
+    Legacy,
+    Enforce,
+}
+
+impl Default for RelayPreflightMode {
+    fn default() -> Self {
+        Self::Legacy
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayQueueFullMode {
+    Bypass,
+    Drop,
+}
+
+impl Default for RelayQueueFullMode {
+    fn default() -> Self {
+        Self::Bypass
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct RelayConnectionPolicy {
+    #[serde(default)]
+    pub preflight_mode: RelayPreflightMode,
+    #[serde(default)]
+    pub queue_full_mode: RelayQueueFullMode,
+}
+
+/// Response from relay ticket bootstrap endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelayTicketResponse {
+    pub token: String,
+    pub expires_at: String,
+    pub auth_required: bool,
+    pub key_id: String,
+    #[serde(default)]
+    pub connection_policy: Option<RelayConnectionPolicy>,
+}
+
+impl RelayTicketResponse {
+    pub fn preflight_mode(&self) -> RelayPreflightMode {
+        self.connection_policy
+            .as_ref()
+            .map(|policy| policy.preflight_mode)
+            .unwrap_or_default()
+    }
+
+    pub fn queue_full_mode(&self) -> RelayQueueFullMode {
+        self.connection_policy
+            .as_ref()
+            .map(|policy| policy.queue_full_mode)
+            .unwrap_or_default()
+    }
 }

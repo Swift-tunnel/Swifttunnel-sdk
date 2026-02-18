@@ -8,12 +8,12 @@
 //! SDK adaptation: V3-only (no V1/V2 routing modes). Process-based routing
 //! with permissive UDP tunneling for trusted processes.
 
+use super::process_tracker::{ConnectionKey, Protocol, TrackerStats};
+use arc_swap::ArcSwap;
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use arc_swap::ArcSwap;
-use super::process_tracker::{ConnectionKey, Protocol, TrackerStats};
 
 // ============================================================================
 // GAME SERVER IP RANGES (for speculative tunneling)
@@ -23,21 +23,16 @@ use super::process_tracker::{ConnectionKey, Protocol, TrackerStats};
 const ROBLOX_RANGES: &[(u32, u32, u32)] = &[
     // PRIMARY GAME SERVERS - covers ALL regional game servers
     (0x80740000, 0xFFFF8000, 17), // 128.116.0.0/17
-
     // SECONDARY GAME SERVERS - San Jose/Palo Alto
     (0xD1CE2800, 0xFFFFF800, 21), // 209.206.40.0/21
-
     // ASIA-PACIFIC
     (0x678C1C00, 0xFFFFFE00, 23), // 103.140.28.0/23
-
     // CHINA (LUOBU)
     (0x678EDC00, 0xFFFFFE00, 23), // 103.142.220.0/23
-
     // API/MATCHMAKING
     (0x17ADC000, 0xFFFFFF00, 24), // 23.173.192.0/24
     (0x8DC10300, 0xFFFFFF00, 24), // 141.193.3.0/24
     (0xCDC93E00, 0xFFFFFF00, 24), // 205.201.62.0/24
-
     // INFRASTRUCTURE
     (0xCC09B800, 0xFFFFFF00, 24), // 204.9.184.0/24
     (0xCC0DA800, 0xFFFFFC00, 22), // 204.13.168.0/22
@@ -66,7 +61,10 @@ const _: () = {
     let mut i = 0;
     while i < ROBLOX_RANGES.len() {
         let (_network, mask, prefix) = ROBLOX_RANGES[i];
-        assert!(is_valid_cidr_mask(mask, prefix), "Invalid CIDR mask in ROBLOX_RANGES");
+        assert!(
+            is_valid_cidr_mask(mask, prefix),
+            "Invalid CIDR mask in ROBLOX_RANGES"
+        );
         i += 1;
     }
 };
@@ -212,7 +210,12 @@ impl ProcessSnapshot {
     /// V3 mode: Skip expensive Windows API calls (no on-demand lookup).
     /// Relies on speculative tunneling via destination IP matching instead.
     #[inline(always)]
-    fn is_tunnel_connection(&self, local_ip: Ipv4Addr, local_port: u16, protocol: Protocol) -> bool {
+    fn is_tunnel_connection(
+        &self,
+        local_ip: Ipv4Addr,
+        local_port: u16,
+        protocol: Protocol,
+    ) -> bool {
         let key = ConnectionKey::new(local_ip, local_port, protocol);
 
         if let Some(&pid) = self.connections.get(&key) {
@@ -271,8 +274,16 @@ impl ProcessSnapshot {
     /// Get stats
     pub fn stats(&self) -> TrackerStats {
         TrackerStats {
-            tcp_connections: self.connections.keys().filter(|k| k.protocol == Protocol::Tcp).count(),
-            udp_connections: self.connections.keys().filter(|k| k.protocol == Protocol::Udp).count(),
+            tcp_connections: self
+                .connections
+                .keys()
+                .filter(|k| k.protocol == Protocol::Tcp)
+                .count(),
+            udp_connections: self
+                .connections
+                .keys()
+                .filter(|k| k.protocol == Protocol::Udp)
+                .count(),
             stale_connections: 0,
             tracked_pids: self.pid_names.len(),
         }
@@ -309,7 +320,11 @@ impl LockFreeProcessCache {
     }
 
     /// Update snapshot (called by single writer thread)
-    pub fn update(&self, connections: HashMap<ConnectionKey, u32>, pid_names: HashMap<u32, String>) {
+    pub fn update(
+        &self,
+        connections: HashMap<ConnectionKey, u32>,
+        pid_names: HashMap<u32, String>,
+    ) {
         let version = self.version.fetch_add(1, Ordering::Relaxed) + 1;
 
         let pid_names_lower: HashMap<u32, String> = pid_names
@@ -377,7 +392,8 @@ impl LockFreeProcessCache {
 
         log::info!(
             "ETW: Immediately registered process {} (PID: {}) for tunneling",
-            name, pid
+            name,
+            pid
         );
     }
 }
@@ -425,8 +441,11 @@ mod tests {
 
         // Should match via 0.0.0.0 fallback
         assert!(snap.should_tunnel_v3(
-            Ipv4Addr::new(192, 168, 1, 100), 50000, Protocol::Udp,
-            Ipv4Addr::new(128, 116, 50, 100), 55000
+            Ipv4Addr::new(192, 168, 1, 100),
+            50000,
+            Protocol::Udp,
+            Ipv4Addr::new(128, 116, 50, 100),
+            55000
         ));
     }
 
@@ -438,14 +457,20 @@ mod tests {
 
         // No process detected, but destination is a known game server -> speculative tunnel
         assert!(snap.should_tunnel_v3(
-            Ipv4Addr::new(192, 168, 1, 100), 50000, Protocol::Udp,
-            Ipv4Addr::new(128, 116, 50, 100), 55000
+            Ipv4Addr::new(192, 168, 1, 100),
+            50000,
+            Protocol::Udp,
+            Ipv4Addr::new(128, 116, 50, 100),
+            55000
         ));
 
         // Non-game destination -> bypass
         assert!(!snap.should_tunnel_v3(
-            Ipv4Addr::new(192, 168, 1, 100), 50000, Protocol::Udp,
-            Ipv4Addr::new(1, 1, 1, 1), 443
+            Ipv4Addr::new(192, 168, 1, 100),
+            50000,
+            Protocol::Udp,
+            Ipv4Addr::new(1, 1, 1, 1),
+            443
         ));
     }
 
@@ -456,17 +481,19 @@ mod tests {
 
         let cache = Arc::new(LockFreeProcessCache::new(vec!["test.exe".to_string()]));
 
-        let readers: Vec<_> = (0..4).map(|_| {
-            let cache_clone = Arc::clone(&cache);
-            thread::spawn(move || {
-                for _ in 0..1000 {
-                    let snap = cache_clone.get_snapshot();
-                    let _ = snap.version;
-                    let _ = snap.connections.len();
-                    thread::sleep(Duration::from_micros(10));
-                }
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let cache_clone = Arc::clone(&cache);
+                thread::spawn(move || {
+                    for _ in 0..1000 {
+                        let snap = cache_clone.get_snapshot();
+                        let _ = snap.version;
+                        let _ = snap.connections.len();
+                        thread::sleep(Duration::from_micros(10));
+                    }
+                })
             })
-        }).collect();
+            .collect();
 
         let cache_writer = Arc::clone(&cache);
         let writer = thread::spawn(move || {

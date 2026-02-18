@@ -2,12 +2,21 @@
 
 Native library for integrating SwiftTunnel VPN into third-party applications. Provides a C ABI (`cdylib`) with 31 functions covering authentication, server selection, V3 relay connection, per-process split tunneling, and app-parity auto-routing.
 
+## Release 1.1.0
+
+- Added additive `connect_ex` options:
+  - `custom_relay_server` (`"host:port"`)
+  - `forced_servers` (`{ "region_id": "server_id" }`)
+- `swifttunnel_auth_get_user_json()` now includes `is_tester`.
+- `swifttunnel_get_state_json()` now includes `assigned_ip` and `relay_auth_mode`.
+- Existing exported symbols, signatures, and integer state/error code meanings are unchanged.
+
 ## Features
 
 - **V3 Relay** - Unencrypted UDP relay for minimum latency gaming (`[session_id][payload]` to port 51821)
 - **Auto Routing (Opt-in)** - Dynamic relay switching by detected game-server region, with whitelist bypass + fail-open behavior
 - **Forced Split Tunneling** - Per-process routing via ndisapi + per-CPU packet workers
-- **Built-in Auth** - Email/password and Google OAuth with auto token refresh
+- **Built-in Auth** - Email/password and Google OAuth with robust refresh handling + tester profile refresh
 - **Credential Storage** - Windows Credential Manager (DPAPI)
 - **ETW Process Detection** - Instant game process detection within microseconds of launch
 - **Language Bindings** - C header (auto-generated), C# P/Invoke, Python ctypes
@@ -34,6 +43,8 @@ int main() {
     const char* options =
         "{\"region\":\"singapore\","
         "\"apps\":[\"RobloxPlayerBeta.exe\"],"
+        "\"custom_relay_server\":\"relay.example.com:51821\","
+        "\"forced_servers\":{\"us-east\":\"us-east-nj\"},"
         "\"auto_routing\":{\"enabled\":true,\"whitelisted_regions\":[\"US East\",\"Tokyo\"]}}";
     swifttunnel_connect_ex(options);
 
@@ -55,6 +66,10 @@ SwiftTunnel.AuthSignIn("user@example.com", "password");
 var options = new {
     region = "singapore",
     apps = new[] { "RobloxPlayerBeta.exe" },
+    custom_relay_server = "relay.example.com:51821",
+    forced_servers = new Dictionary<string, string> {
+        ["us-east"] = "us-east-nj"
+    },
     auto_routing = new {
         enabled = true,
         whitelisted_regions = new[] { "US East", "Tokyo" }
@@ -78,6 +93,8 @@ with SwiftTunnel() as vpn:
     vpn.connect_ex({
         "region": "singapore",
         "apps": ["RobloxPlayerBeta.exe"],
+        "custom_relay_server": "relay.example.com:51821",
+        "forced_servers": {"us-east": "us-east-nj"},
         "auto_routing": {
             "enabled": True,
             "whitelisted_regions": ["US East", "Tokyo"]
@@ -126,10 +143,10 @@ with SwiftTunnel() as vpn:
 | Function | Description |
 |----------|-------------|
 | `swifttunnel_connect(region, apps_json)` | Legacy connect (backward compatible, auto-routing disabled) |
-| `swifttunnel_connect_ex(options_json)` | Connect with JSON options including auto-routing |
+| `swifttunnel_connect_ex(options_json)` | Connect with JSON options (`region`, `apps`, optional `custom_relay_server`, optional `forced_servers`, optional `auto_routing`) |
 | `swifttunnel_disconnect()` | Disconnect |
 | `swifttunnel_get_state()` | Get state code (0=disconnected, 4=connected, -1=error) |
-| `swifttunnel_get_state_json()` | Get detailed state as JSON |
+| `swifttunnel_get_state_json()` | Get detailed state JSON (includes `assigned_ip`, `relay_auth_mode`) |
 
 ### Split Tunnel
 
@@ -169,12 +186,27 @@ with SwiftTunnel() as vpn:
 | 5 | Disconnecting |
 | -1 | Error |
 
+## JSON Contracts
+
+- `swifttunnel_auth_get_user_json()`:
+  - `{"id":"...","email":"...","is_tester":false}`
+- `swifttunnel_connect_ex(options_json)` supports:
+  - `region` (required)
+  - `apps` (optional, default `[]`)
+  - `custom_relay_server` (optional, `"host:port"`)
+  - `forced_servers` (optional, object map `region_id -> server_id`)
+  - `auto_routing` (optional, `{ "enabled": bool, "whitelisted_regions": [] }`)
+- `swifttunnel_get_state_json()` connected payload includes additive fields:
+  - `assigned_ip`
+  - `relay_auth_mode`
+
 ## Architecture
 
 ```
 swifttunnel_connect_ex({
   "region": "singapore",
   "apps": ["game.exe"],
+  "forced_servers": { "us-east": "us-east-nj" },
   "auto_routing": {
     "enabled": true,
     "whitelisted_regions": ["US East", "Tokyo"]
@@ -182,11 +214,12 @@ swifttunnel_connect_ex({
 })
   |
   +-- 1. Auth check -> refresh token if needed
-  +-- 2. POST /api/vpn/generate-config -> VpnConfig
+  +-- 2. Load server list (API/cache) -> resolve relay candidates
   +-- 3. UdpRelay::new(server:51821) -> session_id
-  +-- 4. SplitTunnelDriver (ndisapi + per-CPU workers + ETW)
-  +-- 5. Optional auto-router (geolocation + relay switch)
-  +-- 6. Connected -> callbacks fired
+  +-- 4. Optional relay ticket bootstrap/auth hello (fallback kept)
+  +-- 5. SplitTunnelDriver (ndisapi + per-CPU workers + ETW)
+  +-- 6. Optional auto-router (geolocation + relay switch)
+  +-- 7. Connected -> callbacks fired
 ```
 
 ### Packet Flow

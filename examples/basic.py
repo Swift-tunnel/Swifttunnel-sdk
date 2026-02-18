@@ -60,12 +60,16 @@ def main() -> None:
         except SwiftTunnelError as e:
             print(f"Servers error ({e.code}): {e}", file=sys.stderr)
 
-        # Connect with split tunnelling + auto-routing
+        # Connect with split tunnelling + auto-routing.
+        # Optional additive fields in v1.1.x:
+        # - custom_relay_server: "host:port"
+        # - forced_servers: { region_id: server_id }
         try:
             sdk.connect_ex(
                 {
                     "region": region,
                     "apps": ["RobloxPlayerBeta.exe"],
+                    "forced_servers": {"us-east": "us-east-nj"},
                     "auto_routing": {
                         "enabled": True,
                         "whitelisted_regions": ["US East", "Tokyo"],

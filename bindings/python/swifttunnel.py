@@ -5,7 +5,11 @@ Usage:
 
     with SwiftTunnel() as sdk:
         sdk.auth_sign_in("user@example.com", "password")
-        sdk.connect("singapore", ["RobloxPlayerBeta.exe"])
+        sdk.connect_ex({
+            "region": "singapore",
+            "apps": ["RobloxPlayerBeta.exe"],
+            "forced_servers": {"us-east": "us-east-nj"},
+        })
         print(sdk.state_json)
         sdk.disconnect()
 """
@@ -300,6 +304,7 @@ class SwiftTunnel:
         return self._lib.swifttunnel_auth_is_logged_in() == 1
 
     def auth_get_user(self) -> dict | None:
+        """Returns user JSON as dict, including additive `is_tester`."""
         ptr = self._lib.swifttunnel_auth_get_user_json()
         s = _consume_string(self._lib, ptr)
         return json.loads(s) if s else None
@@ -330,6 +335,15 @@ class SwiftTunnel:
         )
 
     def connect_ex(self, options: dict[str, Any] | str) -> None:
+        """Connect using JSON options.
+
+        Supported keys:
+        - region (required)
+        - apps (optional list[str])
+        - custom_relay_server (optional "host:port")
+        - forced_servers (optional dict[region_id, server_id])
+        - auto_routing (optional {"enabled": bool, "whitelisted_regions": list[str]})
+        """
         if isinstance(options, str):
             payload = options
         else:
@@ -350,6 +364,7 @@ class SwiftTunnel:
 
     @property
     def state_json(self) -> dict | None:
+        """Detailed state JSON (includes additive `assigned_ip` and `relay_auth_mode`)."""
         ptr = self._lib.swifttunnel_get_state_json()
         s = _consume_string(self._lib, ptr)
         return json.loads(s) if s else None

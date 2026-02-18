@@ -11,6 +11,7 @@ mod runtime;
 mod split_tunnel;
 mod vpn;
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::net::SocketAddr;
 use std::os::raw::{c_char, c_void};
@@ -49,7 +50,11 @@ struct ConnectExOptions {
     #[serde(default)]
     apps: Vec<String>,
     #[serde(default)]
+    custom_relay_server: Option<String>,
+    #[serde(default)]
     auto_routing: AutoRoutingOptions,
+    #[serde(default)]
+    forced_servers: HashMap<String, String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -95,9 +100,7 @@ unsafe fn from_c_str<'a>(p: *const c_char) -> Option<&'a str> {
     CStr::from_ptr(p).to_str().ok()
 }
 
-fn load_available_servers_for_auto_routing(
-    state: &mut SdkState,
-) -> Vec<(String, SocketAddr, Option<u32>)> {
+fn load_available_servers(state: &mut SdkState) -> Vec<(String, SocketAddr, Option<u32>)> {
     if state.servers.is_empty() {
         if let Ok((servers, regions, source)) = runtime().block_on(vpn::servers::load_server_list())
         {
@@ -126,19 +129,17 @@ fn connect_with_options(state: &mut SdkState, options: ConnectExOptions) -> i32 
         }
     };
 
-    let available_servers = if options.auto_routing.enabled {
-        load_available_servers_for_auto_routing(state)
-    } else {
-        Vec::new()
-    };
+    let available_servers = load_available_servers(state);
 
     match runtime().block_on(state.vpn.connect_ex(
         &token,
         &options.region,
         options.apps,
+        options.custom_relay_server,
         options.auto_routing.enabled,
         available_servers,
         options.auto_routing.whitelisted_regions,
+        options.forced_servers,
     )) {
         Ok(()) => SUCCESS,
         Err(e) => {
@@ -405,7 +406,7 @@ pub extern "C" fn swifttunnel_auth_is_logged_in() -> i32 {
 /// Get user info as JSON.  Returns null if not logged in.
 /// Caller must free the returned string.
 ///
-/// JSON shape: `{"id":"...","email":"..."}`
+/// JSON shape: `{"id":"...","email":"...","is_tester":false}`
 #[no_mangle]
 pub extern "C" fn swifttunnel_auth_get_user_json() -> *mut c_char {
     clear_error();
@@ -566,7 +567,9 @@ pub unsafe extern "C" fn swifttunnel_connect(
     let options = ConnectExOptions {
         region,
         apps,
+        custom_relay_server: None,
         auto_routing: AutoRoutingOptions::default(),
+        forced_servers: HashMap::new(),
     };
 
     let mut guard = SDK.lock();
@@ -583,7 +586,10 @@ pub unsafe extern "C" fn swifttunnel_connect(
 /// Connect using JSON options.
 ///
 /// JSON contract:
-/// `{ \"region\": \"singapore\", \"apps\": [\"RobloxPlayerBeta.exe\"], \"auto_routing\": { \"enabled\": true, \"whitelisted_regions\": [\"US East\"] } }`
+/// `{ \"region\": \"singapore\", \"apps\": [\"RobloxPlayerBeta.exe\"], \"custom_relay_server\": \"relay.example.com:51821\", \"auto_routing\": { \"enabled\": true, \"whitelisted_regions\": [\"US East\"] }, \"forced_servers\": {\"us-east\": \"us-east-nj\"} }`
+///
+/// `custom_relay_server` and `forced_servers` are optional additive fields.
+/// Legacy payloads with only `region`/`apps` remain valid.
 #[no_mangle]
 pub unsafe extern "C" fn swifttunnel_connect_ex(options_json: *const c_char) -> i32 {
     clear_error();
@@ -681,6 +687,8 @@ pub extern "C" fn swifttunnel_get_state() -> i32 {
 ///   "code": 4,
 ///   "region": "singapore",
 ///   "endpoint": "1.2.3.4:51821",
+///   "assigned_ip": "V3-Relay",
+///   "relay_auth_mode": "authenticated",
 ///   "split_tunnel_active": true,
 ///   "tunneled_processes": ["RobloxPlayerBeta.exe"],
 ///   "error": null
@@ -705,6 +713,8 @@ pub extern "C" fn swifttunnel_get_state_json() -> *mut c_char {
         ConnectionState::Connected {
             server_region,
             server_endpoint,
+            assigned_ip,
+            relay_auth_mode,
             split_tunnel_active,
             tunneled_processes,
             ..
@@ -713,6 +723,8 @@ pub extern "C" fn swifttunnel_get_state_json() -> *mut c_char {
             "code": conn_state.as_code(),
             "region": server_region,
             "endpoint": server_endpoint,
+            "assigned_ip": assigned_ip,
+            "relay_auth_mode": relay_auth_mode,
             "split_tunnel_active": split_tunnel_active,
             "tunneled_processes": tunneled_processes,
             "auto_routing": state
@@ -726,6 +738,8 @@ pub extern "C" fn swifttunnel_get_state_json() -> *mut c_char {
             "code": conn_state.as_code(),
             "region": null,
             "endpoint": null,
+            "assigned_ip": null,
+            "relay_auth_mode": null,
             "split_tunnel_active": false,
             "tunneled_processes": [],
             "auto_routing": state
@@ -739,6 +753,8 @@ pub extern "C" fn swifttunnel_get_state_json() -> *mut c_char {
             "code": other.as_code(),
             "region": null,
             "endpoint": null,
+            "assigned_ip": null,
+            "relay_auth_mode": null,
             "split_tunnel_active": false,
             "tunneled_processes": [],
             "auto_routing": state
@@ -970,8 +986,10 @@ mod tests {
 
         assert_eq!(parsed.region, "singapore");
         assert!(parsed.apps.is_empty());
+        assert!(parsed.custom_relay_server.is_none());
         assert!(!parsed.auto_routing.enabled);
         assert!(parsed.auto_routing.whitelisted_regions.is_empty());
+        assert!(parsed.forced_servers.is_empty());
     }
 
     #[test]
@@ -980,17 +998,27 @@ mod tests {
             r#"{
                 "region":"singapore",
                 "apps":["RobloxPlayerBeta.exe"],
-                "auto_routing":{"enabled":true,"whitelisted_regions":["US East","Tokyo"]}
+                "custom_relay_server":"relay.example.com:51821",
+                "auto_routing":{"enabled":true,"whitelisted_regions":["US East","Tokyo"]},
+                "forced_servers":{"us-east":"us-east-nj"}
             }"#,
         )
         .expect("valid json");
 
         assert_eq!(parsed.region, "singapore");
         assert_eq!(parsed.apps, vec!["RobloxPlayerBeta.exe"]);
+        assert_eq!(
+            parsed.custom_relay_server.as_deref(),
+            Some("relay.example.com:51821")
+        );
         assert!(parsed.auto_routing.enabled);
         assert_eq!(
             parsed.auto_routing.whitelisted_regions,
             vec!["US East", "Tokyo"]
+        );
+        assert_eq!(
+            parsed.forced_servers.get("us-east").map(String::as_str),
+            Some("us-east-nj")
         );
     }
 

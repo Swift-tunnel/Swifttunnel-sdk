@@ -87,9 +87,9 @@ impl RobloxRegion {
             RobloxRegion::Paris => Some("paris"),
             RobloxRegion::Frankfurt => Some("germany"),
             RobloxRegion::Warsaw => Some("germany"),
-            RobloxRegion::UsEast => Some("america"),
-            RobloxRegion::UsCentral => Some("america"),
-            RobloxRegion::UsWest => Some("america"),
+            RobloxRegion::UsEast => Some("us-east"),
+            RobloxRegion::UsCentral => Some("us-central"),
+            RobloxRegion::UsWest => Some("us-west"),
             RobloxRegion::Brazil => Some("brazil"),
         }
     }
@@ -198,4 +198,33 @@ pub async fn lookup_game_server_region(ip: Ipv4Addr) -> Option<(RobloxRegion, St
 
     let region = ipinfo_to_roblox_region(&city, &country);
     Some((region, location))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_us_east_city_to_us_east() {
+        assert_eq!(
+            ipinfo_to_roblox_region("Ashburn", "US"),
+            RobloxRegion::UsEast
+        );
+    }
+
+    #[test]
+    fn maps_us_central_city_to_us_central() {
+        assert_eq!(
+            ipinfo_to_roblox_region("Chicago", "US"),
+            RobloxRegion::UsCentral
+        );
+    }
+
+    #[test]
+    fn maps_unknown_us_city_to_us_west_default() {
+        assert_eq!(
+            ipinfo_to_roblox_region("San Jose", "US"),
+            RobloxRegion::UsWest
+        );
+    }
 }

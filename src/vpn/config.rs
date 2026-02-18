@@ -3,8 +3,8 @@
 //! Handles fetching VPN configuration from the SwiftTunnel API.
 //! V3 SDK only - no WireGuard key generation or parsing.
 
-use serde::{Deserialize, Serialize};
 use crate::auth::types::VpnConfig;
+use serde::{Deserialize, Serialize};
 
 /// API base URL for SwiftTunnel
 const API_BASE_URL: &str = "https://swifttunnel.net";
@@ -85,7 +85,9 @@ pub async fn fetch_vpn_config(
             Ok(config)
         }
         None => {
-            let error = api_response.error.unwrap_or_else(|| "Unknown error".to_string());
+            let error = api_response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string());
             Err(crate::error::SdkError::Vpn(error))
         }
     }
@@ -109,7 +111,11 @@ pub async fn update_latency(
     let client = http_client();
     let url = format!("{}/api/vpn/latency", API_BASE_URL);
 
-    log::info!("Updating latency to {}ms for config {}", latency_ms, config_id);
+    log::info!(
+        "Updating latency to {}ms for config {}",
+        latency_ms,
+        config_id
+    );
 
     let response = client
         .patch(&url)
@@ -140,10 +146,9 @@ pub async fn update_latency(
         server_applied: bool,
     }
 
-    let resp: LatencyResponse = response
-        .json()
-        .await
-        .map_err(|e| crate::error::SdkError::Vpn(format!("Failed to parse latency response: {}", e)))?;
+    let resp: LatencyResponse = response.json().await.map_err(|e| {
+        crate::error::SdkError::Vpn(format!("Failed to parse latency response: {}", e))
+    })?;
 
     if resp.server_applied {
         log::info!("Latency {}ms applied to server immediately", latency_ms);

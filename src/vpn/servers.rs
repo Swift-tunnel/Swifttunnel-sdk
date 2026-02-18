@@ -5,12 +5,12 @@
 //!
 //! Server list is cached locally and refreshed periodically.
 
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 
 /// API endpoint for fetching server list
 const SERVERS_API_URL: &str = "https://swifttunnel.net/api/vpn/servers";
@@ -55,6 +55,39 @@ pub async fn measure_latency(endpoint: &str) -> Option<u32> {
             Some(elapsed.as_millis() as u32)
         }
         _ => None,
+    }
+}
+
+/// Measure latency using ICMP ping (fallback for relay candidate probing).
+pub fn measure_latency_icmp(ip: &str) -> Option<u32> {
+    #[cfg(not(windows))]
+    {
+        let _ = ip;
+        return None;
+    }
+
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("ping")
+            .args(["-n", "1", "-w", "2000", ip])
+            .output()
+            .ok()?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if let Some(time_idx) = line.find("time=") {
+                let rest = &line[time_idx + 5..];
+                if let Some(ms_idx) = rest.find("ms") {
+                    if let Ok(ms) = rest[..ms_idx].parse::<u32>() {
+                        return Some(ms);
+                    }
+                }
+            } else if line.contains("time<1ms") {
+                return Some(0);
+            }
+        }
+
+        None
     }
 }
 
@@ -118,21 +151,22 @@ pub fn load_cached_servers() -> Option<CachedServerList> {
     }
 
     match std::fs::read_to_string(&cache_path) {
-        Ok(content) => {
-            match serde_json::from_str::<CachedServerList>(&content) {
-                Ok(cached) => {
-                    log::info!("Loaded server cache from {:?}, age: {} seconds",
-                        cache_path,
-                        Utc::now().signed_duration_since(cached.cached_at).num_seconds()
-                    );
-                    Some(cached)
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse server cache: {}", e);
-                    None
-                }
+        Ok(content) => match serde_json::from_str::<CachedServerList>(&content) {
+            Ok(cached) => {
+                log::info!(
+                    "Loaded server cache from {:?}, age: {} seconds",
+                    cache_path,
+                    Utc::now()
+                        .signed_duration_since(cached.cached_at)
+                        .num_seconds()
+                );
+                Some(cached)
             }
-        }
+            Err(e) => {
+                log::warn!("Failed to parse server cache: {}", e);
+                None
+            }
+        },
         Err(e) => {
             log::warn!("Failed to read server cache file: {}", e);
             None
@@ -179,22 +213,21 @@ pub async fn fetch_server_list() -> Result<ServerListResponse, crate::error::Sdk
         .build()
         .map_err(|e| crate::error::SdkError::Vpn(format!("Failed to create HTTP client: {}", e)))?;
 
-    let response = client
-        .get(SERVERS_API_URL)
-        .send()
-        .await
-        .map_err(|e| crate::error::SdkError::Vpn(format!("Failed to fetch server list: {}", e)))?;
+    let response =
+        client.get(SERVERS_API_URL).send().await.map_err(|e| {
+            crate::error::SdkError::Vpn(format!("Failed to fetch server list: {}", e))
+        })?;
 
     if !response.status().is_success() {
-        return Err(crate::error::SdkError::Vpn(
-            format!("API returned error status: {}", response.status())
-        ));
+        return Err(crate::error::SdkError::Vpn(format!(
+            "API returned error status: {}",
+            response.status()
+        )));
     }
 
-    let data: ServerListResponse = response
-        .json()
-        .await
-        .map_err(|e| crate::error::SdkError::Vpn(format!("Failed to parse server list JSON: {}", e)))?;
+    let data: ServerListResponse = response.json().await.map_err(|e| {
+        crate::error::SdkError::Vpn(format!("Failed to parse server list JSON: {}", e))
+    })?;
 
     log::info!(
         "Fetched {} servers and {} regions from API (version: {})",
@@ -244,7 +277,14 @@ impl std::fmt::Display for ServerListSource {
 /// 2. If cache is stale or missing, fetch from API
 /// 3. If API fails and cache exists (even stale), use cache
 /// 4. If all else fails, return Error
-pub async fn load_server_list() -> Result<(Vec<DynamicServerInfo>, Vec<DynamicGamingRegion>, ServerListSource), crate::error::SdkError> {
+pub async fn load_server_list() -> Result<
+    (
+        Vec<DynamicServerInfo>,
+        Vec<DynamicGamingRegion>,
+        ServerListSource,
+    ),
+    crate::error::SdkError,
+> {
     // Try to load from cache first
     if let Some(cached) = load_cached_servers() {
         if cached.is_fresh() {
@@ -276,14 +316,11 @@ pub async fn load_server_list() -> Result<(Vec<DynamicServerInfo>, Vec<DynamicGa
     // No cache, try API
     log::info!("No cache found, fetching from API");
     match fetch_server_list().await {
-        Ok(data) => {
-            Ok((data.servers, data.regions, ServerListSource::Api))
-        }
-        Err(e) => {
-            Err(crate::error::SdkError::Vpn(
-                format!("Could not load server list: {}. Please check your internet connection.", e)
-            ))
-        }
+        Ok(data) => Ok((data.servers, data.regions, ServerListSource::Api)),
+        Err(e) => Err(crate::error::SdkError::Vpn(format!(
+            "Could not load server list: {}. Please check your internet connection.",
+            e
+        ))),
     }
 }
 

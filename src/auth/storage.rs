@@ -32,14 +32,11 @@ impl SecureStorage {
         // Get data directory
         let data_dir = dirs::data_local_dir()
             .map(|d| d.join("SwiftTunnel"))
-            .ok_or_else(|| {
-                SdkError::Storage("Could not determine data directory".to_string())
-            })?;
+            .ok_or_else(|| SdkError::Storage("Could not determine data directory".to_string()))?;
 
         // Ensure directory exists
-        std::fs::create_dir_all(&data_dir).map_err(|e| {
-            SdkError::Storage(format!("Failed to create data directory: {}", e))
-        })?;
+        std::fs::create_dir_all(&data_dir)
+            .map_err(|e| SdkError::Storage(format!("Failed to create data directory: {}", e)))?;
 
         info!("SecureStorage initialized:");
         info!("  Data directory: {}", data_dir.display());
@@ -55,10 +52,7 @@ impl SecureStorage {
                 Some(entry)
             }
             Err(e) => {
-                warn!(
-                    "  Keyring: Not available ({}). Using file storage only.",
-                    e
-                );
+                warn!("  Keyring: Not available ({}). Using file storage only.", e);
                 None
             }
         };
@@ -177,9 +171,8 @@ impl SecureStorage {
     fn clear_from_file(&self) -> Result<(), SdkError> {
         let path = self.session_file_path();
         if path.exists() {
-            std::fs::remove_file(&path).map_err(|e| {
-                SdkError::Storage(format!("Failed to delete session file: {}", e))
-            })?;
+            std::fs::remove_file(&path)
+                .map_err(|e| SdkError::Storage(format!("Failed to delete session file: {}", e)))?;
             info!("Cleared session file");
         }
         Ok(())
@@ -341,13 +334,11 @@ impl SecureStorage {
     pub fn save_oauth_state(&self, state: &OAuthPendingState) -> Result<(), SdkError> {
         let path = self.oauth_state_path();
 
-        let json = serde_json::to_string(state).map_err(|e| {
-            SdkError::Storage(format!("Failed to serialize OAuth state: {}", e))
-        })?;
+        let json = serde_json::to_string(state)
+            .map_err(|e| SdkError::Storage(format!("Failed to serialize OAuth state: {}", e)))?;
 
-        std::fs::write(&path, json).map_err(|e| {
-            SdkError::Storage(format!("Failed to write OAuth state: {}", e))
-        })?;
+        std::fs::write(&path, json)
+            .map_err(|e| SdkError::Storage(format!("Failed to write OAuth state: {}", e)))?;
 
         info!("Saved OAuth pending state to: {}", path.display());
         Ok(())
@@ -362,13 +353,11 @@ impl SecureStorage {
             return Ok(None);
         }
 
-        let json = std::fs::read_to_string(&path).map_err(|e| {
-            SdkError::Storage(format!("Failed to read OAuth state: {}", e))
-        })?;
+        let json = std::fs::read_to_string(&path)
+            .map_err(|e| SdkError::Storage(format!("Failed to read OAuth state: {}", e)))?;
 
-        let state: OAuthPendingState = serde_json::from_str(&json).map_err(|e| {
-            SdkError::Storage(format!("Failed to deserialize OAuth state: {}", e))
-        })?;
+        let state: OAuthPendingState = serde_json::from_str(&json)
+            .map_err(|e| SdkError::Storage(format!("Failed to deserialize OAuth state: {}", e)))?;
 
         info!("Loaded OAuth pending state from disk");
         Ok(Some(state))
@@ -379,9 +368,8 @@ impl SecureStorage {
         let path = self.oauth_state_path();
 
         if path.exists() {
-            std::fs::remove_file(&path).map_err(|e| {
-                SdkError::Storage(format!("Failed to remove OAuth state: {}", e))
-            })?;
+            std::fs::remove_file(&path)
+                .map_err(|e| SdkError::Storage(format!("Failed to remove OAuth state: {}", e)))?;
             info!("Cleared OAuth pending state file");
         }
 

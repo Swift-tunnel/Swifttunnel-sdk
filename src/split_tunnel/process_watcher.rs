@@ -19,26 +19,25 @@
 //! - Administrator privileges (for kernel-level ETW provider)
 //! - Windows 10 or later
 
+use crossbeam_channel::{bounded, Receiver, Sender};
+use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use crossbeam_channel::{Sender, Receiver, bounded};
-use parking_lot::RwLock;
 
 #[cfg(windows)]
 use windows::core::{GUID, PCWSTR, PWSTR};
 #[cfg(windows)]
-use windows::Win32::Foundation::{
-    ERROR_SUCCESS, HANDLE,
-};
+use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
 #[cfg(windows)]
 use windows::Win32::System::Diagnostics::Etw::{
-    StartTraceW, ControlTraceW, EnableTraceEx2, OpenTraceW, ProcessTrace, CloseTrace,
-    EVENT_TRACE_PROPERTIES, EVENT_TRACE_LOGFILEW, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP,
-    EVENT_TRACE_REAL_TIME_MODE, TRACE_LEVEL_INFORMATION, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-    PROCESS_TRACE_MODE_REAL_TIME, PROCESS_TRACE_MODE_EVENT_RECORD, WNODE_FLAG_TRACED_GUID,
-    EVENT_TRACE_FLAG_PROCESS, CONTROLTRACE_HANDLE, PROCESSTRACE_HANDLE,
+    CloseTrace, ControlTraceW, EnableTraceEx2, OpenTraceW, ProcessTrace, StartTraceW,
+    CONTROLTRACE_HANDLE, EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_RECORD,
+    EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FLAG_PROCESS, EVENT_TRACE_LOGFILEW,
+    EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, PROCESSTRACE_HANDLE,
+    PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, TRACE_LEVEL_INFORMATION,
+    WNODE_FLAG_TRACED_GUID,
 };
 
 /// Microsoft-Windows-Kernel-Process provider GUID
@@ -164,8 +163,12 @@ fn run_etw_session(
     stop_existing_session();
 
     unsafe {
-        let session_name_wide: Vec<u16> = SESSION_NAME.encode_utf16().chain(std::iter::once(0)).collect();
-        let properties_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + (session_name_wide.len() * 2) + 2;
+        let session_name_wide: Vec<u16> = SESSION_NAME
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let properties_size =
+            std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + (session_name_wide.len() * 2) + 2;
         let mut properties_buffer = vec![0u8; properties_size];
         let properties = properties_buffer.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
 
@@ -176,8 +179,13 @@ fn run_etw_session(
         (*properties).EnableFlags = EVENT_TRACE_FLAG_PROCESS;
         (*properties).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
 
-        let name_dest = (properties as *mut u8).add((*properties).LoggerNameOffset as usize) as *mut u16;
-        std::ptr::copy_nonoverlapping(session_name_wide.as_ptr(), name_dest, session_name_wide.len());
+        let name_dest =
+            (properties as *mut u8).add((*properties).LoggerNameOffset as usize) as *mut u16;
+        std::ptr::copy_nonoverlapping(
+            session_name_wide.as_ptr(),
+            name_dest,
+            session_name_wide.len(),
+        );
 
         let mut session_handle = CONTROLTRACE_HANDLE::default();
         let result = StartTraceW(
@@ -224,7 +232,8 @@ fn run_etw_session(
 
         let mut logfile = EVENT_TRACE_LOGFILEW::default();
         logfile.LoggerName = PWSTR(session_name_wide.as_ptr() as *mut u16);
-        logfile.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+        logfile.Anonymous1.ProcessTraceMode =
+            PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
         logfile.Anonymous2.EventRecordCallback = Some(event_record_callback);
         logfile.Context = context_ptr as *mut c_void;
 
@@ -268,16 +277,25 @@ fn run_etw_session(
 #[cfg(windows)]
 fn stop_existing_session() {
     unsafe {
-        let session_name_wide: Vec<u16> = SESSION_NAME.encode_utf16().chain(std::iter::once(0)).collect();
-        let properties_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + (session_name_wide.len() * 2) + 2;
+        let session_name_wide: Vec<u16> = SESSION_NAME
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let properties_size =
+            std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + (session_name_wide.len() * 2) + 2;
         let mut properties_buffer = vec![0u8; properties_size];
         let properties = properties_buffer.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
 
         (*properties).Wnode.BufferSize = properties_size as u32;
         (*properties).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
 
-        let name_dest = (properties as *mut u8).add((*properties).LoggerNameOffset as usize) as *mut u16;
-        std::ptr::copy_nonoverlapping(session_name_wide.as_ptr(), name_dest, session_name_wide.len());
+        let name_dest =
+            (properties as *mut u8).add((*properties).LoggerNameOffset as usize) as *mut u16;
+        std::ptr::copy_nonoverlapping(
+            session_name_wide.as_ptr(),
+            name_dest,
+            session_name_wide.len(),
+        );
 
         let result = ControlTraceW(
             CONTROLTRACE_HANDLE::default(),
@@ -338,7 +356,9 @@ unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD)
         if should_notify {
             log::info!(
                 "ETW detected watched process: {} (PID: {}, Parent: {})",
-                event.name, event.pid, event.parent_pid
+                event.name,
+                event.pid,
+                event.parent_pid
             );
 
             // Fire callback to notify host application
@@ -390,7 +410,11 @@ unsafe fn parse_process_start_event(record: &EVENT_RECORD) -> Option<ProcessStar
     let image_path = get_process_name_by_pid(event_pid).unwrap_or_default();
 
     if name.is_empty() {
-        name = image_path.rsplit('\\').next().unwrap_or("unknown").to_string();
+        name = image_path
+            .rsplit('\\')
+            .next()
+            .unwrap_or("unknown")
+            .to_string();
     }
 
     let short_name = name.rsplit('\\').next().unwrap_or(&name).to_string();
@@ -406,9 +430,9 @@ unsafe fn parse_process_start_event(record: &EVENT_RECORD) -> Option<ProcessStar
 /// Get process name by PID using Windows API
 #[cfg(windows)]
 fn get_process_name_by_pid(pid: u32) -> Option<String> {
-    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-    use windows::Win32::System::ProcessStatus::GetProcessImageFileNameW;
     use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::ProcessStatus::GetProcessImageFileNameW;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;

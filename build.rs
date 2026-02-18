@@ -9,8 +9,7 @@ fn main() {
     std::fs::create_dir_all(&out_dir).ok();
 
     // Generate C header from Rust FFI exports
-    let config = cbindgen::Config::from_file("cbindgen.toml")
-        .unwrap_or_default();
+    let config = cbindgen::Config::from_file("cbindgen.toml").unwrap_or_default();
 
     cbindgen::Builder::new()
         .with_crate(&crate_dir)
