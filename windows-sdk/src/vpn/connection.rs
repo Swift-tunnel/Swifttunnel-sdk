@@ -492,6 +492,7 @@ impl VpnConnection {
                 return Err(err);
             }
         };
+        relay.set_ping_enabled(true);
         self.relay = Some(Arc::clone(&relay));
 
         let mut relay_auth_mode = if custom_relay_server.is_some() {

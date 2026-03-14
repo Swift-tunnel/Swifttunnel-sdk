@@ -92,7 +92,6 @@ open class SwiftTunnelTransparentProxyProviderBase: NETransparentProxyProvider, 
             defaultRemoteEndpoint: remoteEndpoint,
             signingIdentifier: signingIdentifier
         )
-        let localEndpoint = bridgeLocalEndpoint(for: flow)
 
         flow.open(withLocalFlowEndpoint: flow.localFlowEndpoint) { [weak self] error in
             guard let self else {
@@ -101,6 +100,13 @@ open class SwiftTunnelTransparentProxyProviderBase: NETransparentProxyProvider, 
 
             if let error {
                 NSLog("SwiftTunnel provider failed to open UDP flow \(flowID): \(error)")
+                return
+            }
+
+            guard let localEndpoint = self.bridgeLocalEndpoint(for: flow) else {
+                NSLog("SwiftTunnel provider failed to resolve UDP local endpoint for flow \(flowID)")
+                flow.closeReadWithError(nil)
+                flow.closeWriteWithError(nil)
                 return
             }
 
@@ -222,11 +228,11 @@ open class SwiftTunnelTransparentProxyProviderBase: NETransparentProxyProvider, 
         }
     }
 
-    private func bridgeLocalEndpoint(for flow: NEAppProxyUDPFlow) -> BridgeEndpoint {
+    private func bridgeLocalEndpoint(for flow: NEAppProxyUDPFlow) -> BridgeEndpoint? {
         guard let localFlowEndpoint = flow.localFlowEndpoint,
               let endpoint = BridgeEndpoint(flowEndpoint: localFlowEndpoint)
         else {
-            return BridgeEndpoint(host: "0.0.0.0", port: 0)
+            return nil
         }
 
         return endpoint
