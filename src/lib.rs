@@ -573,6 +573,7 @@ pub unsafe extern "C" fn swifttunnel_connect(
         custom_relay_server: None,
         auto_routing: AutoRoutingOptions::default(),
         forced_servers: HashMap::new(),
+        relay_qos: false,
     };
 
     let mut guard = SDK.lock();
