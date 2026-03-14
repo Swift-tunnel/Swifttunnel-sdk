@@ -158,3 +158,26 @@ pub async fn update_latency(
 
     Ok(resp.server_applied)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vpn_config_request_serialization() {
+        let req = VpnConfigRequest {
+            region: "singapore".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("singapore"));
+    }
+
+    #[test]
+    fn vpn_config_default_fields() {
+        let config = crate::auth::types::VpnConfig::default();
+        assert!(config.region.is_empty());
+        assert!(config.endpoint.is_empty());
+        assert!(!config.phantun_enabled);
+        assert!(config.phantun_port.is_none());
+    }
+}

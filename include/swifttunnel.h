@@ -191,9 +191,18 @@ char *swifttunnel_get_tunneled_processes(void);
  * Returns null if not connected.
  * Caller must free the returned string.
  *
- * JSON shape: `{"packets_sent":123,"packets_recv":456}`
+ * JSON shape: `{"packets_sent":123,"packets_recv":456,"oversize_drops":0,"outbound_drops":0,"send_errors":0,"relay_path_mtu":1500,"ping":{...}}`
  */
 char *swifttunnel_get_stats_json(void);
+
+/**
+ * Get relay ping telemetry as JSON.
+ * Returns null if not connected.
+ * Caller must free the returned string.
+ *
+ * JSON shape: `{"enabled":true,"sent":100,"received":98,"loss_pct":2.0,"last_rtt_ms":5,"p50_rtt_ms":4,"p99_rtt_ms":12,"sample_count":98}`
+ */
+char *swifttunnel_get_ping_json(void);
 
 /**
  * Get auto-routing state as JSON.

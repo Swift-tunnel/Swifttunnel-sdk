@@ -429,3 +429,29 @@ impl Default for SecureStorage {
         Self::new().expect("Failed to create SecureStorage")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xor_obfuscate_roundtrip() {
+        let original = b"hello world, test data for xor obfuscation";
+        let obfuscated = SecureStorage::obfuscate(original);
+        assert_ne!(&obfuscated, original);
+        let roundtrip = SecureStorage::obfuscate(&obfuscated);
+        assert_eq!(&roundtrip, original);
+    }
+
+    #[test]
+    fn session_file_path_construction() {
+        let data_dir = std::path::PathBuf::from("/tmp/swifttunnel-test");
+        let storage = SecureStorage {
+            keyring_entry: None,
+            data_dir,
+        };
+        let path = storage.session_file_path();
+        assert!(path.ends_with("auth_session.dat"));
+        assert!(path.starts_with("/tmp/swifttunnel-test"));
+    }
+}

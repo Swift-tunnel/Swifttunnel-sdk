@@ -106,3 +106,69 @@ pub fn take_last_error() -> Option<String> {
 pub fn last_error_code() -> i32 {
     *LAST_ERROR_CODE.lock()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_code_mapping_all_variants() {
+        assert_eq!(SdkError::Auth("x".into()).code(), ERROR_AUTH);
+        assert_eq!(SdkError::Network("x".into()).code(), ERROR_NETWORK);
+        assert_eq!(SdkError::Config("x".into()).code(), ERROR_CONFIG);
+        assert_eq!(SdkError::SplitTunnel("x".into()).code(), ERROR_SPLIT_TUNNEL);
+        assert_eq!(SdkError::Vpn("x".into()).code(), ERROR_VPN);
+        assert_eq!(
+            SdkError::InvalidParam("x".into()).code(),
+            ERROR_INVALID_PARAM
+        );
+        assert_eq!(SdkError::NotInitialized.code(), ERROR_NOT_INITIALIZED);
+        assert_eq!(SdkError::AlreadyConnected.code(), ERROR_ALREADY_CONNECTED);
+        assert_eq!(SdkError::NotConnected.code(), ERROR_NOT_CONNECTED);
+        assert_eq!(SdkError::Internal("x".into()).code(), ERROR_INTERNAL);
+        assert_eq!(SdkError::Storage("x".into()).code(), ERROR_INTERNAL);
+    }
+
+    #[test]
+    fn set_error_take_last_error_roundtrip() {
+        clear_error();
+        set_error("test error message");
+        let msg = take_last_error();
+        assert_eq!(msg.as_deref(), Some("test error message"));
+        let msg2 = take_last_error();
+        assert_eq!(msg2, None);
+    }
+
+    #[test]
+    fn set_sdk_error_stores_code_and_message() {
+        clear_error();
+        let err = SdkError::Vpn("relay failed".into());
+        set_sdk_error(&err);
+        assert_eq!(last_error_code(), ERROR_VPN);
+        let msg = take_last_error().unwrap();
+        assert!(msg.contains("relay failed"));
+    }
+
+    #[test]
+    fn clear_error_resets_state() {
+        set_error("leftover");
+        *LAST_ERROR_CODE.lock() = -99;
+        clear_error();
+        assert_eq!(last_error_code(), SUCCESS);
+        assert_eq!(take_last_error(), None);
+    }
+
+    #[test]
+    fn last_error_code_defaults_to_success() {
+        clear_error();
+        assert_eq!(last_error_code(), SUCCESS);
+    }
+
+    #[test]
+    fn display_trait_messages() {
+        let err = SdkError::Auth("bad token".into());
+        assert_eq!(err.to_string(), "Authentication error: bad token");
+        let err = SdkError::NotInitialized;
+        assert_eq!(err.to_string(), "Not initialized");
+    }
+}

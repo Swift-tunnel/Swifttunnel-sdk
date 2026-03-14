@@ -190,3 +190,48 @@ impl RelayTicketResponse {
             .unwrap_or_default()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supabase_auth_response_deserializes() {
+        let json = r#"{
+            "access_token": "at",
+            "refresh_token": "rt",
+            "expires_in": 3600,
+            "expires_at": null,
+            "token_type": "bearer",
+            "user": { "id": "uid-123", "email": "test@example.com" }
+        }"#;
+        let resp: SupabaseAuthResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.access_token, "at");
+        assert_eq!(resp.user.email.as_deref(), Some("test@example.com"));
+    }
+
+    #[test]
+    fn relay_ticket_response_deserializes_with_policy() {
+        let json = r#"{
+            "token": "tok",
+            "expires_at": "2026-01-01T00:00:00Z",
+            "auth_required": true,
+            "key_id": "k1",
+            "connection_policy": { "preflight_mode": "enforce", "queue_full_mode": "drop" }
+        }"#;
+        let resp: RelayTicketResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.auth_required);
+        assert_eq!(resp.preflight_mode(), RelayPreflightMode::Enforce);
+        assert_eq!(resp.queue_full_mode(), RelayQueueFullMode::Drop);
+    }
+
+    #[test]
+    fn vpn_config_defaults() {
+        let config = VpnConfig::default();
+        assert!(config.id.is_empty());
+        assert!(config.region.is_empty());
+        assert!(!config.phantun_enabled);
+        assert!(config.allowed_ips.is_empty());
+        assert!(config.dns.is_empty());
+    }
+}

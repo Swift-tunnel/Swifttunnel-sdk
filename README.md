@@ -1,6 +1,17 @@
 # SwiftTunnel SDK
 
-Native library for integrating SwiftTunnel VPN into third-party applications. Provides a C ABI (`cdylib`) with 31 functions covering authentication, server selection, V3 relay connection, per-process split tunneling, and app-parity auto-routing.
+Native library for integrating SwiftTunnel VPN into third-party applications. Provides a C ABI (`cdylib`) with 32 functions covering authentication, server selection, V3 relay connection, per-process split tunneling, and app-parity auto-routing.
+
+## Release 1.2.0
+
+- **Dedicated sender thread** — Eliminates multi-threaded Winsock contention; reduces p99 jitter.
+- **Ping/pong telemetry** — 20 Hz control-plane pings with RTT reporting (`swifttunnel_get_ping_json()`).
+- **MTU detection** — Probes OS route/interface MTU to avoid IP fragmentation; PPPoE-aware clamping.
+- **DSCP QoS** — Optional `relay_qos` flag sets DSCP EF (46) on relay traffic.
+- **Enhanced stats** — `swifttunnel_get_stats_json()` now includes `oversize_drops`, `outbound_drops`, `send_errors`, `relay_path_mtu`, and `ping` sub-object.
+- **Improved auth handshake** — 4 attempts / 1500 ms budget (was 2 / 600 ms).
+- New FFI function: `swifttunnel_get_ping_json()` (#32).
+- New `connect_ex` option: `relay_qos` (boolean, default `false`).
 
 ## Release 1.1.0
 
@@ -17,7 +28,7 @@ Native library for integrating SwiftTunnel VPN into third-party applications. Pr
 - **Auto Routing (Opt-in)** - Dynamic relay switching by detected game-server region, with whitelist bypass + fail-open behavior
 - **Forced Split Tunneling** - Per-process routing via ndisapi + per-CPU packet workers
 - **Built-in Auth** - Email/password and Google OAuth with robust refresh handling + tester profile refresh
-- **Credential Storage** - Windows Credential Manager (DPAPI)
+- **Credential Storage** - Dual: file-based (primary) + OS credential store (secondary fallback)
 - **ETW Process Detection** - Instant game process detection within microseconds of launch
 - **Language Bindings** - C header (auto-generated), C# P/Invoke, Python ctypes
 
@@ -59,10 +70,11 @@ int main() {
 ### C#
 
 ```csharp
-using SwiftTunnelSDK;
+using System.Text.Json;
+using SwiftTunnel;
 
-SwiftTunnel.Init();
-SwiftTunnel.AuthSignIn("user@example.com", "password");
+using var sdk = new SwiftTunnelClient();
+sdk.AuthSignIn("user@example.com", "password");
 var options = new {
     region = "singapore",
     apps = new[] { "RobloxPlayerBeta.exe" },
@@ -75,12 +87,12 @@ var options = new {
         whitelisted_regions = new[] { "US East", "Tokyo" }
     }
 };
-SwiftTunnel.ConnectEx(JsonSerializer.Serialize(options));
+sdk.ConnectEx(JsonSerializer.Serialize(options));
 
 // ... game plays with VPN routing ...
 
-SwiftTunnel.Disconnect();
-SwiftTunnel.Cleanup();
+sdk.Disconnect();
+// sdk.Dispose() called automatically by using statement
 ```
 
 ### Python
@@ -153,7 +165,8 @@ with SwiftTunnel() as vpn:
 | Function | Description |
 |----------|-------------|
 | `swifttunnel_get_tunneled_processes()` | Get tunneled process names (JSON array) |
-| `swifttunnel_get_stats_json()` | Get packet stats (sent/received) |
+| `swifttunnel_get_stats_json()` | Get packet stats (sent/recv, drops, MTU, ping) |
+| `swifttunnel_get_ping_json()` | Get relay ping telemetry (RTT, loss, percentiles) |
 | `swifttunnel_get_auto_routing_json()` | Get auto-routing status and recent events |
 | `swifttunnel_refresh_processes()` | Trigger process cache refresh |
 
@@ -196,9 +209,14 @@ with SwiftTunnel() as vpn:
   - `custom_relay_server` (optional, `"host:port"`)
   - `forced_servers` (optional, object map `region_id -> server_id`)
   - `auto_routing` (optional, `{ "enabled": bool, "whitelisted_regions": [] }`)
+  - `relay_qos` (optional, boolean, default `false`)
 - `swifttunnel_get_state_json()` connected payload includes additive fields:
   - `assigned_ip`
   - `relay_auth_mode`
+- `swifttunnel_get_stats_json()`:
+  - `{"packets_sent":N,"packets_recv":N,"oversize_drops":N,"outbound_drops":N,"send_errors":N,"relay_path_mtu":N,"ping":{...}}`
+- `swifttunnel_get_ping_json()`:
+  - `{"enabled":bool,"sent":N,"received":N,"loss_pct":F,"last_rtt_ms":N|null,"p50_rtt_ms":N|null,"p99_rtt_ms":N|null,"sample_count":N}`
 
 ## Architecture
 
@@ -237,7 +255,7 @@ game.exe UDP packet
 
 ```
 src/
-  lib.rs                    # 31 FFI functions
+  lib.rs                    # 32 FFI functions
   runtime.rs                # Tokio runtime (lazy global)
   error.rs                  # Error types and codes
   callbacks.rs              # State/error/process/auto-routing callbacks

@@ -410,6 +410,11 @@ impl ServerList {
         }
     }
 
+    /// Get the number of servers
+    pub fn server_count(&self) -> usize {
+        self.servers.len()
+    }
+
     /// Get best latency for a gaming region
     pub fn get_region_best_latency(&self, region_id: &str) -> Option<u32> {
         if let Some(region) = self.get_region(region_id) {
@@ -459,5 +464,60 @@ impl ServerList {
         }
 
         best_server.map(|s| (s, best_avg_latency))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_server(region: &str, ip: &str) -> DynamicServerInfo {
+        DynamicServerInfo {
+            region: region.to_string(),
+            name: region.to_string(),
+            country_code: "XX".to_string(),
+            ip: ip.to_string(),
+            port: 51821,
+            phantun_available: false,
+            phantun_port: None,
+        }
+    }
+
+    #[test]
+    fn server_list_operations() {
+        let mut list = ServerList::new_empty();
+        assert!(list.is_empty());
+        assert_eq!(list.server_count(), 0);
+
+        let servers = vec![
+            make_server("singapore-01", "1.2.3.4"),
+            make_server("tokyo-02", "5.6.7.8"),
+        ];
+        let regions = vec![];
+        list.update(servers, regions, ServerListSource::Api);
+
+        assert!(!list.is_empty());
+        assert_eq!(list.server_count(), 2);
+        assert!(list.get_server("singapore-01").is_some());
+        assert!(list.get_server("nonexistent").is_none());
+    }
+
+    #[test]
+    fn latency_storage_and_retrieval() {
+        let mut list = ServerList::new_empty();
+        assert_eq!(list.get_latency("singapore-01"), None);
+
+        list.set_latency("singapore-01", Some(42));
+        assert_eq!(list.get_latency("singapore-01"), Some(42));
+
+        list.set_latency("singapore-01", None);
+        assert_eq!(list.get_latency("singapore-01"), None);
+    }
+
+    #[test]
+    fn is_empty_reflects_state() {
+        let list = ServerList::new_empty();
+        assert!(list.is_empty());
+        assert!(matches!(list.source, ServerListSource::Loading));
     }
 }

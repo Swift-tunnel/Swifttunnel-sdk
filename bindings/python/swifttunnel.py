@@ -115,7 +115,7 @@ def _load_lib() -> CDLL:
     lib.swifttunnel_servers_ping.argtypes = [c_char_p]
     lib.swifttunnel_servers_ping.restype = c_int
 
-    # ── Connection (4) ──────────────────────────────────────────────────
+    # ── Connection (5) ──────────────────────────────────────────────────
     lib.swifttunnel_connect.argtypes = [c_char_p, c_char_p]
     lib.swifttunnel_connect.restype = c_int
 
@@ -131,12 +131,15 @@ def _load_lib() -> CDLL:
     lib.swifttunnel_get_state_json.argtypes = []
     lib.swifttunnel_get_state_json.restype = c_void_p
 
-    # ── Split Tunnel (3) ────────────────────────────────────────────────
+    # ── Split Tunnel (4) ────────────────────────────────────────────────
     lib.swifttunnel_get_tunneled_processes.argtypes = []
     lib.swifttunnel_get_tunneled_processes.restype = c_void_p
 
     lib.swifttunnel_get_stats_json.argtypes = []
     lib.swifttunnel_get_stats_json.restype = c_void_p
+
+    lib.swifttunnel_get_ping_json.argtypes = []
+    lib.swifttunnel_get_ping_json.restype = c_void_p
 
     lib.swifttunnel_get_auto_routing_json.argtypes = []
     lib.swifttunnel_get_auto_routing_json.restype = c_void_p
@@ -144,7 +147,7 @@ def _load_lib() -> CDLL:
     lib.swifttunnel_refresh_processes.argtypes = []
     lib.swifttunnel_refresh_processes.restype = c_int
 
-    # ── Callbacks (3) ───────────────────────────────────────────────────
+    # ── Callbacks (4) ───────────────────────────────────────────────────
     STATE_CB = CFUNCTYPE(None, c_int, c_void_p)
     ERROR_CB = CFUNCTYPE(None, c_int, c_char_p, c_void_p)
     PROCESS_CB = CFUNCTYPE(None, c_char_p, c_int, c_void_p)
@@ -380,6 +383,13 @@ class SwiftTunnel:
     @property
     def stats(self) -> dict | None:
         ptr = self._lib.swifttunnel_get_stats_json()
+        s = _consume_string(self._lib, ptr)
+        return json.loads(s) if s else None
+
+    @property
+    def ping_json(self) -> dict | None:
+        """Relay ping telemetry: enabled, sent, received, loss_pct, p50/p99 RTT."""
+        ptr = self._lib.swifttunnel_get_ping_json()
         s = _consume_string(self._lib, ptr)
         return json.loads(s) if s else None
 

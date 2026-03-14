@@ -83,7 +83,7 @@ namespace SwiftTunnel
         public static extern int swifttunnel_servers_ping(
             [MarshalAs(UnmanagedType.LPUTF8Str)] string region);
 
-        // Connection (4)
+        // Connection (5)
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         public static extern int swifttunnel_connect(
             [MarshalAs(UnmanagedType.LPUTF8Str)] string region,
@@ -102,7 +102,7 @@ namespace SwiftTunnel
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr swifttunnel_get_state_json();
 
-        // Split Tunnel (3)
+        // Split Tunnel (4)
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr swifttunnel_get_tunneled_processes();
 
@@ -110,12 +110,15 @@ namespace SwiftTunnel
         public static extern IntPtr swifttunnel_get_stats_json();
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr swifttunnel_get_ping_json();
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr swifttunnel_get_auto_routing_json();
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         public static extern int swifttunnel_refresh_processes();
 
-        // Callbacks (3)
+        // Callbacks (4)
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         public static extern void swifttunnel_on_state_change(
             StateChangeCallback? cb, IntPtr ctx);
@@ -337,6 +340,11 @@ namespace SwiftTunnel
         public string? StatsJson
         {
             get => ConsumeString(SwiftTunnelNative.swifttunnel_get_stats_json());
+        }
+
+        public string? PingJson
+        {
+            get => ConsumeString(SwiftTunnelNative.swifttunnel_get_ping_json());
         }
 
         public string? AutoRoutingJson

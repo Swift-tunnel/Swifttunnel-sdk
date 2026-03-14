@@ -21,7 +21,7 @@ use crate::callbacks::{fire_auto_routing_event, fire_error, fire_state_change};
 
 use super::auto_routing::{AutoRouter, AutoRoutingEvent};
 use super::geolocation::lookup_game_server_region;
-use super::relay::{RelayAuthAckStatus, UdpRelay};
+use super::relay::{RelayAuthAckStatus, RelayPingSnapshot, RelayStats, UdpRelay};
 use super::servers::measure_latency_icmp;
 
 const REFRESH_INTERVAL_MS: u64 = 50;
@@ -330,6 +330,14 @@ impl VpnConnection {
         self.relay.as_ref().map(|r| r.stats())
     }
 
+    pub fn relay_extended_stats(&self) -> Option<RelayStats> {
+        self.relay.as_ref().map(|r| r.extended_stats())
+    }
+
+    pub fn relay_ping_snapshot(&self) -> Option<RelayPingSnapshot> {
+        self.relay.as_ref().map(|r| r.ping_snapshot())
+    }
+
     pub fn auto_routing_snapshot(&self) -> Option<serde_json::Value> {
         let router = self.auto_router.as_ref()?;
         let events = router
@@ -384,6 +392,7 @@ impl VpnConnection {
             Vec::new(),
             Vec::new(),
             HashMap::new(),
+            false,
         )
         .await
     }
@@ -399,6 +408,7 @@ impl VpnConnection {
         available_servers: Vec<(String, SocketAddr, Option<u32>)>,
         whitelisted_regions: Vec<String>,
         forced_servers: HashMap<String, String>,
+        relay_qos: bool,
     ) -> Result<(), crate::error::SdkError> {
         {
             let state = self.state.lock().await;
@@ -474,7 +484,7 @@ impl VpnConnection {
             }
         };
 
-        let relay = match UdpRelay::new(relay_addr) {
+        let relay = match UdpRelay::new(relay_addr, relay_qos) {
             Ok(relay) => Arc::new(relay),
             Err(err) => {
                 self.set_state(ConnectionState::Error(err.to_string()))

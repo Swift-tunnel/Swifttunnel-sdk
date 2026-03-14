@@ -1,6 +1,6 @@
 //! SwiftTunnel SDK — C FFI entry point
 //!
-//! Exposes 31 `extern "C"` functions for consumption by C#, Python, and other
+//! Exposes 32 `extern "C"` functions for consumption by C#, Python, and other
 //! languages via `cdylib`.  All async work is dispatched through the global
 //! Tokio runtime (`runtime().block_on()`).
 
@@ -55,6 +55,8 @@ struct ConnectExOptions {
     auto_routing: AutoRoutingOptions,
     #[serde(default)]
     forced_servers: HashMap<String, String>,
+    #[serde(default)]
+    relay_qos: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -140,6 +142,7 @@ fn connect_with_options(state: &mut SdkState, options: ConnectExOptions) -> i32 
         available_servers,
         options.auto_routing.whitelisted_regions,
         options.forced_servers,
+        options.relay_qos,
     )) {
         Ok(()) => SUCCESS,
         Err(e) => {
@@ -813,7 +816,7 @@ pub extern "C" fn swifttunnel_get_tunneled_processes() -> *mut c_char {
 /// Returns null if not connected.
 /// Caller must free the returned string.
 ///
-/// JSON shape: `{"packets_sent":123,"packets_recv":456}`
+/// JSON shape: `{"packets_sent":123,"packets_recv":456,"oversize_drops":0,"outbound_drops":0,"send_errors":0,"relay_path_mtu":1500,"ping":{...}}`
 #[no_mangle]
 pub extern "C" fn swifttunnel_get_stats_json() -> *mut c_char {
     clear_error();
@@ -827,11 +830,74 @@ pub extern "C" fn swifttunnel_get_stats_json() -> *mut c_char {
         }
     };
 
-    match state.vpn.relay_stats() {
-        Some((sent, recv)) => {
+    let ext = match state.vpn.relay_extended_stats() {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+
+    let ping_snap = state.vpn.relay_ping_snapshot();
+
+    let ping_json = match ping_snap {
+        Some(snap) => serde_json::json!({
+            "enabled": snap.enabled,
+            "sent": snap.sent,
+            "received": snap.received,
+            "loss_pct": snap.loss_pct,
+            "last_rtt_ms": snap.last_rtt_ms,
+            "p50_rtt_ms": snap.p50_rtt_ms,
+            "p99_rtt_ms": snap.p99_rtt_ms,
+            "sample_count": snap.sample_count,
+        }),
+        None => serde_json::json!(null),
+    };
+
+    let json = serde_json::json!({
+        "packets_sent": ext.packets_sent,
+        "packets_recv": ext.packets_received,
+        "oversize_drops": ext.oversize_drops,
+        "outbound_drops": ext.outbound_drops,
+        "send_errors": ext.send_errors,
+        "relay_path_mtu": ext.relay_path_mtu,
+        "ping": ping_json,
+    });
+    match serde_json::to_string(&json) {
+        Ok(s) => to_c_string(&s),
+        Err(e) => {
+            set_error(format!("JSON serialization failed: {}", e));
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Get relay ping telemetry as JSON.
+/// Returns null if not connected.
+/// Caller must free the returned string.
+///
+/// JSON shape: `{"enabled":true,"sent":100,"received":98,"loss_pct":2.0,"last_rtt_ms":5,"p50_rtt_ms":4,"p99_rtt_ms":12,"sample_count":98}`
+#[no_mangle]
+pub extern "C" fn swifttunnel_get_ping_json() -> *mut c_char {
+    clear_error();
+
+    let guard = SDK.lock();
+    let state = match guard.as_ref() {
+        Some(s) => s,
+        None => {
+            set_sdk_error(&SdkError::NotInitialized);
+            return ptr::null_mut();
+        }
+    };
+
+    match state.vpn.relay_ping_snapshot() {
+        Some(snap) => {
             let json = serde_json::json!({
-                "packets_sent": sent,
-                "packets_recv": recv,
+                "enabled": snap.enabled,
+                "sent": snap.sent,
+                "received": snap.received,
+                "loss_pct": snap.loss_pct,
+                "last_rtt_ms": snap.last_rtt_ms,
+                "p50_rtt_ms": snap.p50_rtt_ms,
+                "p99_rtt_ms": snap.p99_rtt_ms,
+                "sample_count": snap.sample_count,
             });
             match serde_json::to_string(&json) {
                 Ok(s) => to_c_string(&s),
@@ -1026,6 +1092,17 @@ mod tests {
     fn connect_ex_rejects_invalid_json() {
         let parsed: Result<ConnectExOptions, _> = serde_json::from_str("{not-json}");
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn connect_ex_relay_qos_defaults_to_false() {
+        let parsed: ConnectExOptions =
+            serde_json::from_str(r#"{"region":"singapore"}"#).expect("valid json");
+        assert!(!parsed.relay_qos);
+
+        let parsed_with: ConnectExOptions =
+            serde_json::from_str(r#"{"region":"singapore","relay_qos":true}"#).expect("valid json");
+        assert!(parsed_with.relay_qos);
     }
 
     #[test]
