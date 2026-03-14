@@ -1,0 +1,283 @@
+# SwiftTunnel Windows SDK
+
+Native library for integrating SwiftTunnel VPN into third-party Windows applications. This is the current production SDK under `windows-sdk/` and provides a C ABI (`cdylib`) with 32 functions covering authentication, server selection, V3 relay connection, per-process split tunneling, and app-parity auto-routing.
+
+## Release 1.2.0
+
+- **Dedicated sender thread** — Eliminates multi-threaded Winsock contention; reduces p99 jitter.
+- **Ping/pong telemetry** — 20 Hz control-plane pings with RTT reporting (`swifttunnel_get_ping_json()`).
+- **MTU detection** — Probes OS route/interface MTU to avoid IP fragmentation; PPPoE-aware clamping.
+- **DSCP QoS** — Optional `relay_qos` flag sets DSCP EF (46) on relay traffic.
+- **Enhanced stats** — `swifttunnel_get_stats_json()` now includes `oversize_drops`, `outbound_drops`, `send_errors`, `relay_path_mtu`, and `ping` sub-object.
+- **Improved auth handshake** — 4 attempts / 1500 ms budget (was 2 / 600 ms).
+- New FFI function: `swifttunnel_get_ping_json()` (#32).
+- New `connect_ex` option: `relay_qos` (boolean, default `false`).
+
+## Release 1.1.0
+
+- Added additive `connect_ex` options:
+  - `custom_relay_server` (`"host:port"`)
+  - `forced_servers` (`{ "region_id": "server_id" }`)
+- `swifttunnel_auth_get_user_json()` now includes `is_tester`.
+- `swifttunnel_get_state_json()` now includes `assigned_ip` and `relay_auth_mode`.
+- Existing exported symbols, signatures, and integer state/error code meanings are unchanged.
+
+## Features
+
+- **V3 Relay** - Unencrypted UDP relay for minimum latency gaming (`[session_id][payload]` to port 51821)
+- **Auto Routing (Opt-in)** - Dynamic relay switching by detected game-server region, with whitelist bypass + fail-open behavior
+- **Forced Split Tunneling** - Per-process routing via ndisapi + per-CPU packet workers
+- **Built-in Auth** - Email/password and Google OAuth with robust refresh handling + tester profile refresh
+- **Credential Storage** - Dual: file-based (primary) + OS credential store (secondary fallback)
+- **ETW Process Detection** - Instant game process detection within microseconds of launch
+- **Language Bindings** - C header (auto-generated), C# P/Invoke, Python ctypes
+
+## Quick Start
+
+### Build
+
+```bash
+cargo build --release
+# Output: target/release/swifttunnel.dll
+# Header: include/swifttunnel.h
+```
+
+### C
+
+```c
+#include "swifttunnel.h"
+
+int main() {
+    swifttunnel_init();
+    swifttunnel_auth_sign_in("user@example.com", "password");
+
+    const char* options =
+        "{\"region\":\"singapore\","
+        "\"apps\":[\"RobloxPlayerBeta.exe\"],"
+        "\"custom_relay_server\":\"relay.example.com:51821\","
+        "\"forced_servers\":{\"us-east\":\"us-east-nj\"},"
+        "\"auto_routing\":{\"enabled\":true,\"whitelisted_regions\":[\"US East\",\"Tokyo\"]}}";
+    swifttunnel_connect_ex(options);
+
+    // Game traffic is now relayed through the VPN
+    // Other traffic bypasses normally
+
+    swifttunnel_disconnect();
+    swifttunnel_cleanup();
+}
+```
+
+### C#
+
+```csharp
+using System.Text.Json;
+using SwiftTunnel;
+
+using var sdk = new SwiftTunnelClient();
+sdk.AuthSignIn("user@example.com", "password");
+var options = new {
+    region = "singapore",
+    apps = new[] { "RobloxPlayerBeta.exe" },
+    custom_relay_server = "relay.example.com:51821",
+    forced_servers = new Dictionary<string, string> {
+        ["us-east"] = "us-east-nj"
+    },
+    auto_routing = new {
+        enabled = true,
+        whitelisted_regions = new[] { "US East", "Tokyo" }
+    }
+};
+sdk.ConnectEx(JsonSerializer.Serialize(options));
+
+// ... game plays with VPN routing ...
+
+sdk.Disconnect();
+// sdk.Dispose() called automatically by using statement
+```
+
+### Python
+
+```python
+from swifttunnel import SwiftTunnel
+
+with SwiftTunnel() as vpn:
+    vpn.auth_sign_in("user@example.com", "password")
+    vpn.connect_ex({
+        "region": "singapore",
+        "apps": ["RobloxPlayerBeta.exe"],
+        "custom_relay_server": "relay.example.com:51821",
+        "forced_servers": {"us-east": "us-east-nj"},
+        "auto_routing": {
+            "enabled": True,
+            "whitelisted_regions": ["US East", "Tokyo"]
+        }
+    })
+
+    # ... game plays with VPN routing ...
+
+    vpn.disconnect()
+```
+
+## API Reference
+
+### Core
+
+| Function | Description |
+|----------|-------------|
+| `swifttunnel_init()` | Initialize the SDK |
+| `swifttunnel_cleanup()` | Tear down and release resources |
+| `swifttunnel_version()` | Get SDK version string |
+| `swifttunnel_free_string(ptr)` | Free a string returned by the SDK |
+
+### Authentication
+
+| Function | Description |
+|----------|-------------|
+| `swifttunnel_auth_sign_in(email, password)` | Sign in with email/password |
+| `swifttunnel_auth_start_oauth()` | Start Google OAuth, returns URL |
+| `swifttunnel_auth_poll_oauth()` | Poll OAuth completion (1=done, 0=waiting, -1=error) |
+| `swifttunnel_auth_cancel_oauth()` | Cancel OAuth flow |
+| `swifttunnel_auth_refresh()` | Refresh access token |
+| `swifttunnel_auth_sign_out()` | Sign out and clear credentials |
+| `swifttunnel_auth_is_logged_in()` | Check login status (1/0) |
+| `swifttunnel_auth_get_user_json()` | Get user info as JSON |
+
+### Servers
+
+| Function | Description |
+|----------|-------------|
+| `swifttunnel_servers_fetch()` | Fetch server list from API |
+| `swifttunnel_servers_get_json()` | Get cached server list as JSON |
+| `swifttunnel_servers_ping(region)` | Measure latency to region (ms) |
+
+### Connection
+
+| Function | Description |
+|----------|-------------|
+| `swifttunnel_connect(region, apps_json)` | Legacy connect (backward compatible, auto-routing disabled) |
+| `swifttunnel_connect_ex(options_json)` | Connect with JSON options (`region`, `apps`, optional `custom_relay_server`, optional `forced_servers`, optional `auto_routing`) |
+| `swifttunnel_disconnect()` | Disconnect |
+| `swifttunnel_get_state()` | Get state code (0=disconnected, 4=connected, -1=error) |
+| `swifttunnel_get_state_json()` | Get detailed state JSON (includes `assigned_ip`, `relay_auth_mode`) |
+
+### Split Tunnel
+
+| Function | Description |
+|----------|-------------|
+| `swifttunnel_get_tunneled_processes()` | Get tunneled process names (JSON array) |
+| `swifttunnel_get_stats_json()` | Get packet stats (sent/recv, drops, MTU, ping) |
+| `swifttunnel_get_ping_json()` | Get relay ping telemetry (RTT, loss, percentiles) |
+| `swifttunnel_get_auto_routing_json()` | Get auto-routing status and recent events |
+| `swifttunnel_refresh_processes()` | Trigger process cache refresh |
+
+### Callbacks
+
+| Function | Description |
+|----------|-------------|
+| `swifttunnel_on_state_change(cb, ctx)` | Register state change callback |
+| `swifttunnel_on_error(cb, ctx)` | Register error callback |
+| `swifttunnel_on_process_detected(cb, ctx)` | Register process detection callback |
+| `swifttunnel_on_auto_routing_event(cb, ctx)` | Register auto-routing event callback (JSON payload) |
+
+### Error
+
+| Function | Description |
+|----------|-------------|
+| `swifttunnel_get_last_error()` | Get last error message |
+| `swifttunnel_get_last_error_code()` | Get last error code |
+| `swifttunnel_clear_error()` | Clear error state |
+
+## Connection States
+
+| Code | State |
+|------|-------|
+| 0 | Disconnected |
+| 1 | FetchingConfig |
+| 2 | Connecting |
+| 3 | ConfiguringSplitTunnel |
+| 4 | Connected |
+| 5 | Disconnecting |
+| -1 | Error |
+
+## JSON Contracts
+
+- `swifttunnel_auth_get_user_json()`:
+  - `{"id":"...","email":"...","is_tester":false}`
+- `swifttunnel_connect_ex(options_json)` supports:
+  - `region` (required)
+  - `apps` (optional, default `[]`)
+  - `custom_relay_server` (optional, `"host:port"`)
+  - `forced_servers` (optional, object map `region_id -> server_id`)
+  - `auto_routing` (optional, `{ "enabled": bool, "whitelisted_regions": [] }`)
+  - `relay_qos` (optional, boolean, default `false`)
+- `swifttunnel_get_state_json()` connected payload includes additive fields:
+  - `assigned_ip`
+  - `relay_auth_mode`
+- `swifttunnel_get_stats_json()`:
+  - `{"packets_sent":N,"packets_recv":N,"oversize_drops":N,"outbound_drops":N,"send_errors":N,"relay_path_mtu":N,"ping":{...}}`
+- `swifttunnel_get_ping_json()`:
+  - `{"enabled":bool,"sent":N,"received":N,"loss_pct":F,"last_rtt_ms":N|null,"p50_rtt_ms":N|null,"p99_rtt_ms":N|null,"sample_count":N}`
+
+## Architecture
+
+```
+swifttunnel_connect_ex({
+  "region": "singapore",
+  "apps": ["game.exe"],
+  "forced_servers": { "us-east": "us-east-nj" },
+  "auto_routing": {
+    "enabled": true,
+    "whitelisted_regions": ["US East", "Tokyo"]
+  }
+})
+  |
+  +-- 1. Auth check -> refresh token if needed
+  +-- 2. Load server list (API/cache) -> resolve relay candidates
+  +-- 3. UdpRelay::new(server:51821) -> session_id
+  +-- 4. Optional relay ticket bootstrap/auth hello (fallback kept)
+  +-- 5. SplitTunnelDriver (ndisapi + per-CPU workers + ETW)
+  +-- 6. Optional auto-router (geolocation + relay switch)
+  +-- 7. Connected -> callbacks fired
+```
+
+### Packet Flow
+
+```
+game.exe UDP packet
+  -> ndisapi intercepts on physical adapter
+  -> ParallelInterceptor (hash dispatch to CPU worker)
+  -> ProcessCache O(1) lookup -> PID -> process name
+  -> In tunnel_apps? YES -> [session_id][payload] -> relay:51821
+  -> In tunnel_apps? NO  -> passthrough
+```
+
+## Project Structure
+
+```
+src/
+  lib.rs                    # 32 FFI functions
+  runtime.rs                # Tokio runtime (lazy global)
+  error.rs                  # Error types and codes
+  callbacks.rs              # State/error/process/auto-routing callbacks
+  auth/                     # Authentication (manager, client, storage, OAuth)
+  vpn/                      # V3 relay, server list, config, connection state machine
+  split_tunnel/             # ndisapi interceptor, process cache, tracker, ETW watcher
+bindings/
+  csharp/SwiftTunnelSDK.cs  # C# P/Invoke wrapper
+  python/swifttunnel.py     # Python ctypes wrapper
+examples/
+  basic.c, basic.cs, basic.py
+include/
+  swifttunnel.h             # Auto-generated C header (cbindgen)
+```
+
+## Requirements
+
+- **Windows 10/11** (64-bit)
+- **Administrator privileges** (for ndisapi packet interception)
+- **Windows Packet Filter driver** (ndisapi.sys)
+- **Rust toolchain** (for building)
+
+## License
+
+Proprietary - SwiftTunnel

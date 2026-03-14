@@ -3,7 +3,7 @@ name = "swifttunnel-sdk"
 version = "1.2.0"
 edition = "2021"
 authors = ["SwiftTunnel <support@swifttunnel.net>"]
-description = "SwiftTunnel VPN SDK - V3 relay with forced split tunneling and built-in auth"
+description = "SwiftTunnel Windows SDK - V3 relay with forced split tunneling and built-in auth"
 
 [lib]
 crate-type = ["cdylib"]
