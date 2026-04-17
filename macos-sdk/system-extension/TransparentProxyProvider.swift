@@ -1,0 +1,4 @@
+import NetworkExtension
+import SwiftTunnelTransparentProxyProvider
+
+final class TransparentProxyProvider: SwiftTunnelTransparentProxyProviderBase {}

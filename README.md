@@ -1,232 +1,53 @@
 # SwiftTunnel SDK
 
-Native library for integrating SwiftTunnel VPN into third-party applications. Provides a C ABI (`cdylib`) with 31 functions covering authentication, server selection, V3 relay connection, per-process split tunneling, and app-parity auto-routing.
+Platform SDK container for third-party SwiftTunnel integrations.
 
-## Features
+## Layout
 
-- **V3 Relay** - Unencrypted UDP relay for minimum latency gaming (`[session_id][payload]` to port 51821)
-- **Auto Routing (Opt-in)** - Dynamic relay switching by detected game-server region, with whitelist bypass + fail-open behavior
-- **Forced Split Tunneling** - Per-process routing via ndisapi + per-CPU packet workers
-- **Built-in Auth** - Email/password and Google OAuth with auto token refresh
-- **Credential Storage** - Windows Credential Manager (DPAPI)
-- **ETW Process Detection** - Instant game process detection within microseconds of launch
-- **Language Bindings** - C header (auto-generated), C# P/Invoke, Python ctypes
+| Directory | Status | Purpose |
+|-----------|--------|---------|
+| `windows-sdk/` | Production | Existing Windows C ABI SDK with ndisapi-based split tunneling |
+| `macos-sdk/` | Implemented | macOS C ABI SDK built around `NETransparentProxyProvider`, a Swift helper, and a host-app system extension |
 
-## Quick Start
-
-### Build
+## Build
 
 ```bash
-cargo build --release
-# Output: target/release/swifttunnel.dll
-# Header: include/swifttunnel.h
+# Windows SDK
+cd windows-sdk && cargo build --release
+
+# macOS Rust SDK
+cd macos-sdk && cargo build --release
+
+# macOS helper/provider Swift package
+cd macos-sdk/apple && swift build
 ```
 
-### C
+## Windows SDK
 
-```c
-#include "swifttunnel.h"
+The current shipping SDK lives in [`windows-sdk/`](windows-sdk/README.md). It keeps the existing 32-function C ABI, V3 relay client, built-in auth flow, Windows keyring storage, ETW process detection, and ndisapi packet interception.
 
-int main() {
-    swifttunnel_init();
-    swifttunnel_auth_sign_in("user@example.com", "password");
+## Release 1.3.0 (Windows + macOS)
 
-    const char* options =
-        "{\"region\":\"singapore\","
-        "\"apps\":[\"RobloxPlayerBeta.exe\"],"
-        "\"auto_routing\":{\"enabled\":true,\"whitelisted_regions\":[\"US East\",\"Tokyo\"]}}";
-    swifttunnel_connect_ex(options);
+- `swifttunnel_get_stats_json()` includes a new `relay_health` string field: one of `"healthy"`, `"no_traffic_yet"`, `"stale"`, `"dead"`.
+- UDP sender thread is wrapped in `catch_unwind`; sender-thread panics are surfaced instead of silently halting the tunnel.
+- New async `UdpRelay::send_keepalive_burst_async()` yields via tokio instead of `std::thread::sleep`.
+- FFI surface unchanged (still 32 functions); existing `get_stats_json` callers gain one optional new field.
 
-    // Game traffic is now relayed through the VPN
-    // Other traffic bypasses normally
+## macOS SDK
 
-    swifttunnel_disconnect();
-    swifttunnel_cleanup();
-}
-```
+[`macos-sdk/`](macos-sdk/README.md) now contains the full macOS source implementation. It keeps the same FFI/API surface as the Windows SDK, but the split-tunnel layer is implemented with a Swift `NETransparentProxyProvider`, a helper CLI that manages `NETransparentProxyManager`, and a localhost UDP bridge into the Rust relay client. The Apple-side package currently targets macOS 15.
 
-### C#
+| Windows Component | macOS Equivalent | Effort |
+|---|---|---|
+| `ndisapi` split tunnel | `NETransparentProxyProvider` System Extension | Major |
+| Socket tuning | POSIX `setsockopt` | Trivial |
+| MTU detection | `getifaddrs()` + `route get` | Small |
+| ETW process detection | `sourceAppAuditToken` on intercepted flows | None |
+| `GetTickCount64` monotonic time | Existing `Instant` fallback | None |
+| DPAPI credential storage | `keyring` on macOS Keychain | Trivial |
 
-```csharp
-using SwiftTunnelSDK;
+## Relay Framing
 
-SwiftTunnel.Init();
-SwiftTunnel.AuthSignIn("user@example.com", "password");
-var options = new {
-    region = "singapore",
-    apps = new[] { "RobloxPlayerBeta.exe" },
-    auto_routing = new {
-        enabled = true,
-        whitelisted_regions = new[] { "US East", "Tokyo" }
-    }
-};
-SwiftTunnel.ConnectEx(JsonSerializer.Serialize(options));
+The macOS SDK currently preserves the existing relay wire format by reconstructing an IPv4+UDP packet from provider flow metadata before forwarding to the relay. That keeps the relay server unchanged at the cost of limiting the transparent-proxy path to IPv4 UDP flows for now.
 
-// ... game plays with VPN routing ...
-
-SwiftTunnel.Disconnect();
-SwiftTunnel.Cleanup();
-```
-
-### Python
-
-```python
-from swifttunnel import SwiftTunnel
-
-with SwiftTunnel() as vpn:
-    vpn.auth_sign_in("user@example.com", "password")
-    vpn.connect_ex({
-        "region": "singapore",
-        "apps": ["RobloxPlayerBeta.exe"],
-        "auto_routing": {
-            "enabled": True,
-            "whitelisted_regions": ["US East", "Tokyo"]
-        }
-    })
-
-    # ... game plays with VPN routing ...
-
-    vpn.disconnect()
-```
-
-## API Reference
-
-### Core
-
-| Function | Description |
-|----------|-------------|
-| `swifttunnel_init()` | Initialize the SDK |
-| `swifttunnel_cleanup()` | Tear down and release resources |
-| `swifttunnel_version()` | Get SDK version string |
-| `swifttunnel_free_string(ptr)` | Free a string returned by the SDK |
-
-### Authentication
-
-| Function | Description |
-|----------|-------------|
-| `swifttunnel_auth_sign_in(email, password)` | Sign in with email/password |
-| `swifttunnel_auth_start_oauth()` | Start Google OAuth, returns URL |
-| `swifttunnel_auth_poll_oauth()` | Poll OAuth completion (1=done, 0=waiting, -1=error) |
-| `swifttunnel_auth_cancel_oauth()` | Cancel OAuth flow |
-| `swifttunnel_auth_refresh()` | Refresh access token |
-| `swifttunnel_auth_sign_out()` | Sign out and clear credentials |
-| `swifttunnel_auth_is_logged_in()` | Check login status (1/0) |
-| `swifttunnel_auth_get_user_json()` | Get user info as JSON |
-
-### Servers
-
-| Function | Description |
-|----------|-------------|
-| `swifttunnel_servers_fetch()` | Fetch server list from API |
-| `swifttunnel_servers_get_json()` | Get cached server list as JSON |
-| `swifttunnel_servers_ping(region)` | Measure latency to region (ms) |
-
-### Connection
-
-| Function | Description |
-|----------|-------------|
-| `swifttunnel_connect(region, apps_json)` | Legacy connect (backward compatible, auto-routing disabled) |
-| `swifttunnel_connect_ex(options_json)` | Connect with JSON options including auto-routing |
-| `swifttunnel_disconnect()` | Disconnect |
-| `swifttunnel_get_state()` | Get state code (0=disconnected, 4=connected, -1=error) |
-| `swifttunnel_get_state_json()` | Get detailed state as JSON |
-
-### Split Tunnel
-
-| Function | Description |
-|----------|-------------|
-| `swifttunnel_get_tunneled_processes()` | Get tunneled process names (JSON array) |
-| `swifttunnel_get_stats_json()` | Get packet stats (sent/received) |
-| `swifttunnel_get_auto_routing_json()` | Get auto-routing status and recent events |
-| `swifttunnel_refresh_processes()` | Trigger process cache refresh |
-
-### Callbacks
-
-| Function | Description |
-|----------|-------------|
-| `swifttunnel_on_state_change(cb, ctx)` | Register state change callback |
-| `swifttunnel_on_error(cb, ctx)` | Register error callback |
-| `swifttunnel_on_process_detected(cb, ctx)` | Register process detection callback |
-| `swifttunnel_on_auto_routing_event(cb, ctx)` | Register auto-routing event callback (JSON payload) |
-
-### Error
-
-| Function | Description |
-|----------|-------------|
-| `swifttunnel_get_last_error()` | Get last error message |
-| `swifttunnel_get_last_error_code()` | Get last error code |
-| `swifttunnel_clear_error()` | Clear error state |
-
-## Connection States
-
-| Code | State |
-|------|-------|
-| 0 | Disconnected |
-| 1 | FetchingConfig |
-| 2 | Connecting |
-| 3 | ConfiguringSplitTunnel |
-| 4 | Connected |
-| 5 | Disconnecting |
-| -1 | Error |
-
-## Architecture
-
-```
-swifttunnel_connect_ex({
-  "region": "singapore",
-  "apps": ["game.exe"],
-  "auto_routing": {
-    "enabled": true,
-    "whitelisted_regions": ["US East", "Tokyo"]
-  }
-})
-  |
-  +-- 1. Auth check -> refresh token if needed
-  +-- 2. POST /api/vpn/generate-config -> VpnConfig
-  +-- 3. UdpRelay::new(server:51821) -> session_id
-  +-- 4. SplitTunnelDriver (ndisapi + per-CPU workers + ETW)
-  +-- 5. Optional auto-router (geolocation + relay switch)
-  +-- 6. Connected -> callbacks fired
-```
-
-### Packet Flow
-
-```
-game.exe UDP packet
-  -> ndisapi intercepts on physical adapter
-  -> ParallelInterceptor (hash dispatch to CPU worker)
-  -> ProcessCache O(1) lookup -> PID -> process name
-  -> In tunnel_apps? YES -> [session_id][payload] -> relay:51821
-  -> In tunnel_apps? NO  -> passthrough
-```
-
-## Project Structure
-
-```
-src/
-  lib.rs                    # 31 FFI functions
-  runtime.rs                # Tokio runtime (lazy global)
-  error.rs                  # Error types and codes
-  callbacks.rs              # State/error/process/auto-routing callbacks
-  auth/                     # Authentication (manager, client, storage, OAuth)
-  vpn/                      # V3 relay, server list, config, connection state machine
-  split_tunnel/             # ndisapi interceptor, process cache, tracker, ETW watcher
-bindings/
-  csharp/SwiftTunnelSDK.cs  # C# P/Invoke wrapper
-  python/swifttunnel.py     # Python ctypes wrapper
-examples/
-  basic.c, basic.cs, basic.py
-include/
-  swifttunnel.h             # Auto-generated C header (cbindgen)
-```
-
-## Requirements
-
-- **Windows 10/11** (64-bit)
-- **Administrator privileges** (for ndisapi packet interception)
-- **Windows Packet Filter driver** (ndisapi.sys)
-- **Rust toolchain** (for building)
-
-## License
-
-Proprietary - SwiftTunnel
+Apple-specific note: the source tree is complete, but shipping the macOS SDK still requires a signed host app, Network Extension entitlements, and system-extension approval on the user’s Mac.
