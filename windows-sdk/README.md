@@ -2,6 +2,14 @@
 
 Native library for integrating SwiftTunnel VPN into third-party Windows applications. This is the current production SDK under `windows-sdk/` and provides a C ABI (`cdylib`) with 32 functions covering authentication, server selection, V3 relay connection, per-process split tunneling, and app-parity auto-routing.
 
+## Release 1.3.0
+
+- **Relay health tracking** — `swifttunnel_get_stats_json()` now includes a `relay_health` string field (`"healthy"`, `"no_traffic_yet"`, `"stale"`, `"dead"`) computed from inbound traffic silence and unanswered keepalive counts. Mirrors the desktop app's silent-disconnect detection.
+- **Sender-thread panic recovery** — The dedicated UDP sender thread is now wrapped in `catch_unwind`; a panic no longer silently halts tunneling. The `UdpRelay::sender_panicked()` Rust API exposes the flag for bindings that embed the crate directly.
+- **Async keepalive burst** — New `UdpRelay::send_keepalive_burst_async()` yields via `tokio::time::sleep` between packets so async callers don't freeze a tokio worker for the full 100 ms burst.
+- **Low-overhead activity tracking** — `last_activity` moved to `AtomicU64` (monotonic ms) and the ping sample window + sender handle switched to `parking_lot::Mutex`, removing per-packet mutex lock/unlock on the keepalive hot path.
+- Existing exported FFI symbols, signatures, and integer state/error codes are unchanged. Existing `get_stats_json` consumers gain a new field and can keep ignoring it.
+
 ## Release 1.2.0
 
 - **Dedicated sender thread** — Eliminates multi-threaded Winsock contention; reduces p99 jitter.

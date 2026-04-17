@@ -338,6 +338,10 @@ impl VpnConnection {
         self.relay.as_ref().map(|r| r.ping_snapshot())
     }
 
+    pub fn relay_health_str(&self) -> Option<&'static str> {
+        self.relay.as_ref().map(|r| r.relay_health().as_str())
+    }
+
     pub fn auto_routing_snapshot(&self) -> Option<serde_json::Value> {
         let router = self.auto_router.as_ref()?;
         let events = router

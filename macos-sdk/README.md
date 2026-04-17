@@ -4,6 +4,14 @@ Native macOS SwiftTunnel SDK with the same C ABI as the Windows SDK, implemented
 
 Minimum Apple-side deployment target: macOS 15. The Swift package uses the modern `Network.NWEndpoint`-based transparent-proxy APIs that Apple exposes in the current Swift overlay.
 
+## Release 1.3.0
+
+- **Relay health tracking** — `swifttunnel_get_stats_json()` now includes a `relay_health` string (`"healthy"`, `"no_traffic_yet"`, `"stale"`, `"dead"`) derived from inbound traffic silence and unanswered keepalive counts.
+- **Sender-thread panic recovery** — The UDP sender thread is wrapped in `catch_unwind`; a panic no longer silently halts tunneling.
+- **Async keepalive burst** — `UdpRelay::send_keepalive_burst_async()` yields between packets via `tokio::time::sleep` so the tokio worker is not frozen for the full 100 ms burst.
+- **Atomic activity tracking** — `last_activity` moved to `AtomicU64` (monotonic ms) and sample window switched to `parking_lot::Mutex` to remove per-packet mutex overhead on the keepalive hot path.
+- FFI surface unchanged — existing consumers gain one new JSON field and can keep ignoring it.
+
 ## What Is Implemented
 
 - Rust SDK core

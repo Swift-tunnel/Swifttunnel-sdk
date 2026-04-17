@@ -1,6 +1,6 @@
 [package]
 name = "swifttunnel-sdk"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2021"
 authors = ["SwiftTunnel <support@swifttunnel.net>"]
 description = "SwiftTunnel Windows SDK - V3 relay with forced split tunneling and built-in auth"

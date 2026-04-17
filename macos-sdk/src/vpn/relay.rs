@@ -5,7 +5,7 @@ use crossbeam_channel as channel;
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,49 @@ const PING_IDLE_INTERVAL: Duration = Duration::from_millis(250);
 const PING_SAMPLE_WINDOW: usize = 1024;
 
 const RELAY_SWITCH_GRACE_PERIOD: Duration = Duration::from_secs(2);
+
+/// After receiving traffic, if no inbound packet arrives for this long, declare relay stale.
+const RELAY_STALE_THRESHOLD: Duration = Duration::from_secs(30);
+/// After this many unanswered keepalives (~60s at 15s interval), declare relay dead.
+const RELAY_DEAD_KEEPALIVE_THRESHOLD: u32 = 4;
+
+/// Relay health states visible to the connection manager and SDK consumers.
+///
+/// Tracks the liveness of the relay connection so the system can detect
+/// silent disconnects and take corrective action.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayHealthState {
+    /// Relay is actively receiving traffic.
+    Healthy = 0,
+    /// Connected but no inbound packets received yet.
+    NoTrafficYet = 1,
+    /// Was receiving traffic, but stopped for >30s.
+    Stale = 2,
+    /// No response to multiple consecutive keepalives (~60s).
+    Dead = 3,
+}
+
+impl RelayHealthState {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Healthy,
+            1 => Self::NoTrafficYet,
+            2 => Self::Stale,
+            3 => Self::Dead,
+            _ => Self::NoTrafficYet,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::NoTrafficYet => "no_traffic_yet",
+            Self::Stale => "stale",
+            Self::Dead => "dead",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RelayPathContext {
@@ -162,7 +205,7 @@ struct PingMetrics {
     sent: AtomicU64,
     received: AtomicU64,
     last_rtt_ms: AtomicU64,
-    samples: std::sync::Mutex<VecDeque<u32>>,
+    samples: parking_lot::Mutex<VecDeque<u32>>,
 }
 
 impl PingMetrics {
@@ -172,7 +215,7 @@ impl PingMetrics {
             sent: AtomicU64::new(0),
             received: AtomicU64::new(0),
             last_rtt_ms: AtomicU64::new(0),
-            samples: std::sync::Mutex::new(VecDeque::with_capacity(PING_SAMPLE_WINDOW)),
+            samples: parking_lot::Mutex::new(VecDeque::with_capacity(PING_SAMPLE_WINDOW)),
         }
     }
 
@@ -180,12 +223,11 @@ impl PingMetrics {
         self.received.fetch_add(1, Ordering::Relaxed);
         self.last_rtt_ms.store(rtt_ms as u64, Ordering::Relaxed);
 
-        if let Ok(mut samples) = self.samples.lock() {
-            if samples.len() >= PING_SAMPLE_WINDOW {
-                samples.pop_front();
-            }
-            samples.push_back(rtt_ms);
+        let mut samples = self.samples.lock();
+        if samples.len() >= PING_SAMPLE_WINDOW {
+            samples.pop_front();
         }
+        samples.push_back(rtt_ms);
     }
 
     fn snapshot(&self) -> RelayPingSnapshot {
@@ -209,7 +251,8 @@ impl PingMetrics {
         let mut p99_rtt_ms: Option<u32> = None;
         let mut sample_count = 0usize;
 
-        if let Ok(samples) = self.samples.lock() {
+        {
+            let samples = self.samples.lock();
             sample_count = samples.len();
             if sample_count > 0 {
                 let mut values: Vec<u32> = samples.iter().copied().collect();
@@ -436,11 +479,22 @@ pub struct UdpRelay {
     mtu_detect_failures: AtomicU64,
     point_to_point_mtu_clamp_active: AtomicBool,
     point_to_point_mtu_clamp_events: AtomicU64,
-    last_activity: std::sync::Mutex<Instant>,
-    sender_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Last activity timestamp (monotonic milliseconds via `now_mono_ms`).
+    /// Read on the keepalive hot path as an atomic to avoid mutex overhead.
+    last_activity_ms: AtomicU64,
+    sender_handle: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
     outbound_pool: Arc<OutboundPool>,
     outbound_tx: channel::Sender<OutboundJob>,
     ping: Arc<PingMetrics>,
+    /// Relay health state — shared with connection manager for silent disconnect detection.
+    relay_health: Arc<AtomicU8>,
+    /// Consecutive keepalives sent without receiving any inbound traffic.
+    unanswered_keepalives: AtomicU32,
+    /// Last time an inbound data packet was received (not control frames).
+    last_receive_time: parking_lot::Mutex<Option<Instant>>,
+    /// Set to true if the sender thread panics. Connection manager polls this so the
+    /// state machine can surface a real failure instead of a frozen-but-"connected" tunnel.
+    sender_panicked: Arc<AtomicBool>,
 }
 
 impl UdpRelay {
@@ -541,97 +595,120 @@ impl UdpRelay {
         let sender_ping = Arc::clone(&ping);
         let sender_send_errors = Arc::clone(&send_errors);
         let sender_session_id = session_id;
+        let sender_panicked = Arc::new(AtomicBool::new(false));
+        let sender_panicked_for_thread = Arc::clone(&sender_panicked);
         let sender_handle = std::thread::Builder::new()
             .name("udp-relay-sender".to_string())
             .spawn(move || {
-                let mut last_relay_addr: Option<SocketAddr> = None;
-                let mut last_data_at: Option<Instant> = None;
-                let mut ping_seq: u32 = 0;
-                let mut next_ping_at = Instant::now() + PING_INTERVAL;
+                // Wrap the entire body in catch_unwind so a panic here doesn't
+                // silently halt tunneling — instead surface it via the
+                // sender_panicked flag that the connection manager polls.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut last_relay_addr: Option<SocketAddr> = None;
+                    let mut last_data_at: Option<Instant> = None;
+                    let mut ping_seq: u32 = 0;
+                    let mut next_ping_at = Instant::now() + PING_INTERVAL;
 
-                loop {
-                    if sender_stop.load(Ordering::Acquire) {
-                        break;
-                    }
+                    loop {
+                        if sender_stop.load(Ordering::Acquire) {
+                            break;
+                        }
 
-                    let now = Instant::now();
-                    let timeout = next_ping_at
-                        .saturating_duration_since(now)
-                        .min(Duration::from_millis(50));
+                        let now = Instant::now();
+                        let timeout = next_ping_at
+                            .saturating_duration_since(now)
+                            .min(Duration::from_millis(50));
 
-                    match outbound_rx.recv_timeout(timeout) {
-                        Ok(job) => {
-                            last_relay_addr = Some(job.addr);
-                            last_data_at = Some(Instant::now());
+                        match outbound_rx.recv_timeout(timeout) {
+                            Ok(job) => {
+                                last_relay_addr = Some(job.addr);
+                                last_data_at = Some(Instant::now());
 
-                            let bytes = unsafe { sender_pool.buffer(job.buf_idx) };
-                            if let Err(e) = sender_socket.send_to(&bytes[..job.len], job.addr) {
-                                let count = sender_send_errors.fetch_add(1, Ordering::Relaxed) + 1;
-                                if count <= 5 || count.is_power_of_two() {
-                                    log::warn!(
-                                        "UDP Relay: Sender thread send_to error #{} to {}: {}",
-                                        count,
-                                        job.addr,
-                                        e
-                                    );
+                                let bytes = unsafe { sender_pool.buffer(job.buf_idx) };
+                                if let Err(e) = sender_socket.send_to(&bytes[..job.len], job.addr) {
+                                    let count =
+                                        sender_send_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if count <= 5 || count.is_power_of_two() {
+                                        log::warn!(
+                                            "UDP Relay: Sender thread send_to error #{} to {}: {}",
+                                            count,
+                                            job.addr,
+                                            e
+                                        );
+                                    }
                                 }
+                                sender_pool.release(job.buf_idx);
                             }
-                            sender_pool.release(job.buf_idx);
+                            Err(channel::RecvTimeoutError::Timeout) => {}
+                            Err(channel::RecvTimeoutError::Disconnected) => break,
                         }
-                        Err(channel::RecvTimeoutError::Timeout) => {}
-                        Err(channel::RecvTimeoutError::Disconnected) => break,
-                    }
 
-                    let now = Instant::now();
-                    if !sender_ping.enabled.load(Ordering::Acquire) {
-                        continue;
-                    }
-
-                    let Some(relay_addr) = last_relay_addr else {
-                        continue;
-                    };
-
-                    let Some(last_data_at) = last_data_at else {
-                        continue;
-                    };
-
-                    if now.duration_since(last_data_at) >= PING_IDLE_THRESHOLD {
-                        next_ping_at = now + PING_IDLE_INTERVAL;
-                        continue;
-                    }
-
-                    if now < next_ping_at {
-                        continue;
-                    }
-
-                    ping_seq = ping_seq.wrapping_add(1);
-                    let client_ts_mono_ms = now_mono_ms();
-
-                    let mut frame = [0u8; PING_FRAME_LEN];
-                    frame[..SESSION_ID_LEN].copy_from_slice(&sender_session_id);
-                    frame[SESSION_ID_LEN] = PING_FRAME_TYPE;
-                    frame[SESSION_ID_LEN + 1..SESSION_ID_LEN + 5]
-                        .copy_from_slice(&ping_seq.to_be_bytes());
-                    frame[SESSION_ID_LEN + 5..SESSION_ID_LEN + 13]
-                        .copy_from_slice(&client_ts_mono_ms.to_be_bytes());
-
-                    if let Err(e) = sender_socket.send_to(&frame, relay_addr) {
-                        let count = sender_send_errors.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count <= 5 || count.is_power_of_two() {
-                            log::warn!(
-                                "UDP Relay: Sender thread ping send_to error #{} to {}: {}",
-                                count,
-                                relay_addr,
-                                e
-                            );
+                        let now = Instant::now();
+                        if !sender_ping.enabled.load(Ordering::Acquire) {
+                            continue;
                         }
-                    }
-                    sender_ping.sent.fetch_add(1, Ordering::Relaxed);
-                    next_ping_at = now + PING_INTERVAL;
-                }
 
-                while let Ok(job) = outbound_rx.try_recv() {
-                    sender_pool.release(job.buf_idx);
+                        let Some(relay_addr) = last_relay_addr else {
+                            continue;
+                        };
+
+                        let Some(last_data_at) = last_data_at else {
+                            continue;
+                        };
+
+                        if now.duration_since(last_data_at) >= PING_IDLE_THRESHOLD {
+                            next_ping_at = now + PING_IDLE_INTERVAL;
+                            continue;
+                        }
+
+                        if now < next_ping_at {
+                            continue;
+                        }
+
+                        ping_seq = ping_seq.wrapping_add(1);
+                        let client_ts_mono_ms = now_mono_ms();
+
+                        let mut frame = [0u8; PING_FRAME_LEN];
+                        frame[..SESSION_ID_LEN].copy_from_slice(&sender_session_id);
+                        frame[SESSION_ID_LEN] = PING_FRAME_TYPE;
+                        frame[SESSION_ID_LEN + 1..SESSION_ID_LEN + 5]
+                            .copy_from_slice(&ping_seq.to_be_bytes());
+                        frame[SESSION_ID_LEN + 5..SESSION_ID_LEN + 13]
+                            .copy_from_slice(&client_ts_mono_ms.to_be_bytes());
+
+                        if let Err(e) = sender_socket.send_to(&frame, relay_addr) {
+                            let count = sender_send_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                            if count <= 5 || count.is_power_of_two() {
+                                log::warn!(
+                                    "UDP Relay: Sender thread ping send_to error #{} to {}: {}",
+                                    count,
+                                    relay_addr,
+                                    e
+                                );
+                            }
+                        }
+                        sender_ping.sent.fetch_add(1, Ordering::Relaxed);
+                        next_ping_at = now + PING_INTERVAL;
+                    }
+
+                    while let Ok(job) = outbound_rx.try_recv() {
+                        sender_pool.release(job.buf_idx);
+                    }
+                }));
+
+                if let Err(panic_payload) = result {
+                    sender_panicked_for_thread.store(true, Ordering::Release);
+                    let msg = if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "<non-string panic payload>".to_string()
+                    };
+                    log::error!(
+                        "UDP Relay: Sender thread panicked — tunneling halted: {}",
+                        msg
+                    );
                 }
             })
             .map_err(|e| {
@@ -703,12 +780,23 @@ impl UdpRelay {
                     0
                 },
             ),
-            last_activity: std::sync::Mutex::new(Instant::now()),
-            sender_handle: std::sync::Mutex::new(Some(sender_handle)),
+            last_activity_ms: AtomicU64::new(now_mono_ms()),
+            sender_handle: parking_lot::Mutex::new(Some(sender_handle)),
             outbound_pool,
             outbound_tx,
             ping,
+            relay_health: Arc::new(AtomicU8::new(RelayHealthState::NoTrafficYet as u8)),
+            unanswered_keepalives: AtomicU32::new(0),
+            last_receive_time: parking_lot::Mutex::new(None),
+            sender_panicked,
         })
+    }
+
+    /// Returns true if the sender thread panicked. The connection manager should
+    /// surface a real failure if this becomes true so consumers see an error
+    /// instead of a frozen-but-"connected" tunnel.
+    pub fn sender_panicked(&self) -> bool {
+        self.sender_panicked.load(Ordering::Acquire)
     }
 
     pub fn session_id_u64(&self) -> u64 {
@@ -1001,9 +1089,8 @@ impl UdpRelay {
         }
 
         self.packets_sent.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut guard) = self.last_activity.lock() {
-            *guard = Instant::now();
-        }
+        self.last_activity_ms
+            .store(now_mono_ms(), Ordering::Relaxed);
 
         Ok(total_len)
     }
@@ -1082,8 +1169,16 @@ impl UdpRelay {
 
                 buffer[..payload_len].copy_from_slice(&recv_buf[SESSION_ID_LEN..len]);
                 self.packets_received.fetch_add(1, Ordering::Relaxed);
-                if let Ok(mut guard) = self.last_activity.lock() {
-                    *guard = Instant::now();
+                let now = Instant::now();
+                self.last_activity_ms
+                    .store(now_mono_ms(), Ordering::Relaxed);
+                // Mark relay as healthy on every successful data packet
+                self.relay_health
+                    .store(RelayHealthState::Healthy as u8, Ordering::Relaxed);
+                self.unanswered_keepalives.store(0, Ordering::Relaxed);
+                {
+                    let mut guard = self.last_receive_time.lock();
+                    *guard = Some(now);
                 }
                 Ok(Some(payload_len))
             }
@@ -1098,12 +1193,14 @@ impl UdpRelay {
         self.socket
             .send_to(&self.session_id, current_addr)
             .map_err(|e| crate::error::SdkError::Vpn(format!("Failed to send keepalive: {}", e)))?;
-        if let Ok(mut guard) = self.last_activity.lock() {
-            *guard = Instant::now();
-        }
+        self.last_activity_ms
+            .store(now_mono_ms(), Ordering::Relaxed);
         Ok(())
     }
 
+    /// Send a burst of keepalives to quickly establish NAT mapping and relay session.
+    /// Sends 3 keepalives at 0ms, 50ms, 100ms spacing. SYNC version: blocks the
+    /// calling thread for ~100ms — do not call from a tokio runtime worker.
     pub fn send_keepalive_burst(&self) -> Result<(), crate::error::SdkError> {
         let current_addr = **self.relay_addr.load();
         for i in 0..3 {
@@ -1121,22 +1218,104 @@ impl UdpRelay {
                 Err(e) => log::warn!("UDP Relay keepalive burst #{} failed: {}", i + 1, e),
             }
         }
-        if let Ok(mut guard) = self.last_activity.lock() {
-            *guard = Instant::now();
+        // Count burst as unanswered keepalive so Dead state is reachable
+        self.unanswered_keepalives.fetch_add(1, Ordering::Relaxed);
+        self.last_activity_ms
+            .store(now_mono_ms(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Async variant of `send_keepalive_burst` that yields between packets via
+    /// `tokio::time::sleep` instead of `std::thread::sleep`. Use this from async
+    /// contexts to avoid freezing the tokio worker for the full 100ms burst.
+    pub async fn send_keepalive_burst_async(&self) -> Result<(), crate::error::SdkError> {
+        let current_addr = **self.relay_addr.load();
+        for i in 0..3 {
+            if i > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            match self.socket.send_to(&self.session_id, current_addr) {
+                Ok(_) => {}
+                Err(e) if i == 0 => {
+                    return Err(crate::error::SdkError::Vpn(format!(
+                        "Async keepalive burst failed: {}",
+                        e
+                    )))
+                }
+                Err(e) => log::warn!(
+                    "UDP Relay async keepalive burst #{} failed: {}",
+                    i + 1,
+                    e
+                ),
+            }
+        }
+        self.unanswered_keepalives.fetch_add(1, Ordering::Relaxed);
+        self.last_activity_ms
+            .store(now_mono_ms(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Send keepalive to maintain NAT binding. Increments the unanswered keepalive
+    /// counter — reset to zero whenever an inbound data packet is received.
+    pub fn send_keepalive(&self) -> Result<(), crate::error::SdkError> {
+        let now_ms = now_mono_ms();
+        let last_ms = self.last_activity_ms.load(Ordering::Relaxed);
+        let elapsed = Duration::from_millis(now_ms.saturating_sub(last_ms));
+        if elapsed >= KEEPALIVE_INTERVAL {
+            let current_addr = **self.relay_addr.load();
+            self.socket.send_to(&self.session_id, current_addr).map_err(
+                |e| crate::error::SdkError::Vpn(format!("Failed to send keepalive: {}", e)),
+            )?;
+            self.last_activity_ms.store(now_ms, Ordering::Relaxed);
+            self.unanswered_keepalives.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
     }
 
-    pub fn send_keepalive(&self) -> Result<(), crate::error::SdkError> {
-        let should_send = self
-            .last_activity
-            .lock()
-            .map(|guard| guard.elapsed() >= KEEPALIVE_INTERVAL)
-            .unwrap_or(true);
-        if should_send {
-            self.send_keepalive_now()?;
+    /// Get the current relay health state.
+    pub fn relay_health(&self) -> RelayHealthState {
+        RelayHealthState::from_u8(self.relay_health.load(Ordering::Relaxed))
+    }
+
+    /// Get an Arc to the relay health atomic for sharing with the connection manager.
+    pub fn relay_health_arc(&self) -> Arc<AtomicU8> {
+        Arc::clone(&self.relay_health)
+    }
+
+    /// Evaluate relay health based on inbound traffic silence and unanswered keepalives.
+    /// Updates the health state to Stale or Dead when the relay stops responding.
+    pub fn check_health(&self) {
+        let last_rx = { *self.last_receive_time.lock() };
+        let Some(last_rx) = last_rx else {
+            // Never received traffic - stay at NoTrafficYet (initial connect phase)
+            return;
+        };
+
+        let silence = last_rx.elapsed();
+        let unanswered = self.unanswered_keepalives.load(Ordering::Relaxed);
+        let current = self.relay_health();
+
+        if unanswered >= RELAY_DEAD_KEEPALIVE_THRESHOLD {
+            if current != RelayHealthState::Dead {
+                self.relay_health
+                    .store(RelayHealthState::Dead as u8, Ordering::Relaxed);
+                log::error!(
+                    "UDP Relay: Health -> DEAD ({} unanswered keepalives, {}s silence, session {:016x})",
+                    unanswered,
+                    silence.as_secs(),
+                    self.session_id_u64()
+                );
+            }
+        } else if silence >= RELAY_STALE_THRESHOLD && current == RelayHealthState::Healthy {
+            self.relay_health
+                .store(RelayHealthState::Stale as u8, Ordering::Relaxed);
+            log::warn!(
+                "UDP Relay: Health -> STALE ({}s since last inbound packet, {} unanswered keepalives, session {:016x})",
+                silence.as_secs(),
+                unanswered,
+                self.session_id_u64()
+            );
         }
-        Ok(())
     }
 
     pub fn stats(&self) -> (u64, u64) {
@@ -1161,7 +1340,7 @@ impl UdpRelay {
         self.stop_flag.store(true, Ordering::Release);
         let ping = self.ping.snapshot();
         log::info!(
-            "UDP Relay: Stopped session {:016x} (sent: {}, recv: {}, oversize_drops: {}, outbound_drops: {}, send_errors: {}, pppoe_clamp_active: {}, pppoe_clamp_events: {}, ping: {}/{} {:.1}% loss)",
+            "UDP Relay: Stopped session {:016x} (sent: {}, recv: {}, oversize_drops: {}, outbound_drops: {}, send_errors: {}, pppoe_clamp_active: {}, pppoe_clamp_events: {}, health: {}, ping: {}/{} {:.1}% loss)",
             self.session_id_u64(),
             self.packets_sent.load(Ordering::Relaxed),
             self.packets_received.load(Ordering::Relaxed),
@@ -1170,6 +1349,7 @@ impl UdpRelay {
             self.send_errors.load(Ordering::Relaxed),
             self.point_to_point_mtu_clamp_active.load(Ordering::Acquire),
             self.point_to_point_mtu_clamp_events.load(Ordering::Relaxed),
+            self.relay_health().as_str(),
             ping.sent,
             ping.received,
             ping.loss_pct,
@@ -1193,6 +1373,17 @@ impl UdpRelay {
         self.relay_addr.store(Arc::new(new_addr));
         self.last_mtu_refresh_ms.store(0, Ordering::Relaxed);
         self.maybe_refresh_relay_path_mtu(new_addr);
+        // Reset health state for the new relay - give it a clean slate
+        self.relay_health
+            .store(RelayHealthState::NoTrafficYet as u8, Ordering::Relaxed);
+        self.unanswered_keepalives.store(0, Ordering::Relaxed);
+        log::info!(
+            "UDP Relay: Switched relay {} -> {} (session {:016x}, grace period {}s)",
+            old_addr,
+            new_addr,
+            self.session_id_u64(),
+            RELAY_SWITCH_GRACE_PERIOD.as_secs()
+        );
     }
 
     pub fn session_id_bytes(&self) -> &[u8; SESSION_ID_LEN] {
@@ -1204,11 +1395,7 @@ impl Drop for UdpRelay {
     fn drop(&mut self) {
         self.stop();
 
-        let handle = self
-            .sender_handle
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.take());
+        let handle = self.sender_handle.lock().take();
         if let Some(handle) = handle {
             if let Err(panic) = handle.join() {
                 log::error!("UDP Relay: sender thread panicked: {:?}", panic);

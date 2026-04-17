@@ -200,7 +200,9 @@ char *swifttunnel_get_tunneled_processes(void);
  * Returns null if not connected.
  * Caller must free the returned string.
  *
- * JSON shape: `{"packets_sent":123,"packets_recv":456,"oversize_drops":0,"outbound_drops":0,"send_errors":0,"relay_path_mtu":1500,"ping":{...}}`
+ * JSON shape: `{"packets_sent":123,"packets_recv":456,"oversize_drops":0,"outbound_drops":0,"send_errors":0,"relay_path_mtu":1500,"relay_health":"healthy","ping":{...}}`
+ *
+ * `relay_health` is one of: `"healthy"`, `"no_traffic_yet"`, `"stale"`, `"dead"`.
  */
 char *swifttunnel_get_stats_json(void);
 

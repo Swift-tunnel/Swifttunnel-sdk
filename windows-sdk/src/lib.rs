@@ -817,7 +817,9 @@ pub extern "C" fn swifttunnel_get_tunneled_processes() -> *mut c_char {
 /// Returns null if not connected.
 /// Caller must free the returned string.
 ///
-/// JSON shape: `{"packets_sent":123,"packets_recv":456,"oversize_drops":0,"outbound_drops":0,"send_errors":0,"relay_path_mtu":1500,"ping":{...}}`
+/// JSON shape: `{"packets_sent":123,"packets_recv":456,"oversize_drops":0,"outbound_drops":0,"send_errors":0,"relay_path_mtu":1500,"relay_health":"healthy","ping":{...}}`
+///
+/// `relay_health` is one of: `"healthy"`, `"no_traffic_yet"`, `"stale"`, `"dead"`.
 #[no_mangle]
 pub extern "C" fn swifttunnel_get_stats_json() -> *mut c_char {
     clear_error();
@@ -837,6 +839,7 @@ pub extern "C" fn swifttunnel_get_stats_json() -> *mut c_char {
     };
 
     let ping_snap = state.vpn.relay_ping_snapshot();
+    let relay_health = state.vpn.relay_health_str();
 
     let ping_json = match ping_snap {
         Some(snap) => serde_json::json!({
@@ -859,6 +862,7 @@ pub extern "C" fn swifttunnel_get_stats_json() -> *mut c_char {
         "outbound_drops": ext.outbound_drops,
         "send_errors": ext.send_errors,
         "relay_path_mtu": ext.relay_path_mtu,
+        "relay_health": relay_health,
         "ping": ping_json,
     });
     match serde_json::to_string(&json) {

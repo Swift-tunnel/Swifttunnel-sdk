@@ -26,6 +26,13 @@ cd macos-sdk/apple && swift build
 
 The current shipping SDK lives in [`windows-sdk/`](windows-sdk/README.md). It keeps the existing 32-function C ABI, V3 relay client, built-in auth flow, Windows keyring storage, ETW process detection, and ndisapi packet interception.
 
+## Release 1.3.0 (Windows + macOS)
+
+- `swifttunnel_get_stats_json()` includes a new `relay_health` string field: one of `"healthy"`, `"no_traffic_yet"`, `"stale"`, `"dead"`.
+- UDP sender thread is wrapped in `catch_unwind`; sender-thread panics are surfaced instead of silently halting the tunnel.
+- New async `UdpRelay::send_keepalive_burst_async()` yields via tokio instead of `std::thread::sleep`.
+- FFI surface unchanged (still 32 functions); existing `get_stats_json` callers gain one optional new field.
+
 ## macOS SDK
 
 [`macos-sdk/`](macos-sdk/README.md) now contains the full macOS source implementation. It keeps the same FFI/API surface as the Windows SDK, but the split-tunnel layer is implemented with a Swift `NETransparentProxyProvider`, a helper CLI that manages `NETransparentProxyManager`, and a localhost UDP bridge into the Rust relay client. The Apple-side package currently targets macOS 15.
